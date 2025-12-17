@@ -63,6 +63,9 @@ def run_dft(xc):
     mf = rks.RKS(mol, xc=xc).density_fit(auxbasis=auxbasis)
     mf = itrf.add_mm_charges(
         mf, [[1,2,-1],[3,4,5]], np.eye(3)*15, [-5,5], [0.8,1.2], rcut_ewald=8, rcut_hcore=6)
+    #mf.mm_mol.debug_self02 = True
+    #mf.mm_mol.enable_octupole = True
+    #mf.mm_mol.energy_decomp = True
     mf.conv_tol = scf_tol
     mf.max_cycle = max_scf_cycles
     mf.direct_scf_tol = screen_tol
