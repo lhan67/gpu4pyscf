@@ -27,6 +27,7 @@ from gpu4pyscf import scf
 from gpu4pyscf.qmmm.pbc import mm_mole
 from gpu4pyscf.lib import cupy_helper
 from gpu4pyscf.qmmm.pbc.tools import get_multipole_tensors_pp, get_multipole_tensors_pg
+from gpu4pyscf.qmmm.pbc.tools import get_qm_octupoles
 from gpu4pyscf.gto.int3c1e import int1e_grids
 from gpu4pyscf.gto.int3c1e_ip import int1e_grids_ip1, int1e_grids_ip2
 
@@ -96,6 +97,7 @@ def qmmm_for_scf(method, mm_mol):
             method.mm_mol = mm_mol
             method.s1r = None
             method.s1rr = None
+            method.s1rrr = None
             method.mm_ewald_pot = None
             method.qm_ewald_hess = None
             method.e_nuc = None
@@ -114,7 +116,7 @@ class QMMM:
 _QMMM = QMMM
 
 class QMMMSCF(QMMM):
-    _keys = {'mm_mol', 's1r', 's1rr', 'mm_ewald_pot', 'qm_ewald_hess', 'e_nuc'}
+    _keys = {'mm_mol', 's1r', 's1rr', 's1rrr', 'mm_ewald_pot', 'qm_ewald_hess', 'e_nuc'}
 
     to_cpu     = NotImplemented
     as_scanner = NotImplemented
@@ -124,6 +126,7 @@ class QMMMSCF(QMMM):
         self.mm_mol = mm_mol
         self.s1r = None
         self.s1rr = None
+        self.s1rrr = None
         self.mm_ewald_pot = None
         self.qm_ewald_hess = None
         self.e_nuc = None
@@ -160,13 +163,44 @@ class QMMMSCF(QMMM):
         charges = self.get_qm_charges(dm)
         dips = self.get_qm_dipoles(dm)
         quads = self.get_qm_quadrupoles(dm)
+        if self.mm_mol.enable_octupole:
+            octus = get_qm_octupoles(self.mol, dm)
         ewpot0  = contract('ij,j->i', qm_ewald_hess[0], charges)
         ewpot0 += contract('ijx,jx->i', qm_ewald_hess[1], dips)
         ewpot0 += contract('ijxy,jxy->i', qm_ewald_hess[3], quads)
         ewpot1  = contract('ijx,i->jx', qm_ewald_hess[1], charges)
         ewpot1 += contract('ijxy,jy->ix', qm_ewald_hess[2], dips)
         ewpot2  = contract('ijxy,j->ixy', qm_ewald_hess[3], charges)
-        return ewpot0, ewpot1, ewpot2
+        if self.mm_mol.enable_octupole:
+            ewpot0 += contract('ijxyz,jxyz->i', qm_ewald_hess[5], octus)
+            ewpot1 += contract('ijxyz,jyz->ix', qm_ewald_hess[4], quads)
+            ewpot2 += contract('ijxyz,iz->ixy', qm_ewald_hess[4], dips)
+            ewpot3  = contract('ijxyz,i->jxyz', qm_ewald_hess[5], charges)
+        if self.mm_mol.energy_decomp:
+            ewpot0_ = list()
+            ewpot0_.append(contract('ij,j->i', qm_ewald_hess[0], charges))
+            ewpot0_.append(contract('ijx,jx->i', qm_ewald_hess[1], dips))
+            ewpot0_.append(contract('ijxy,jxy->i', qm_ewald_hess[3], quads))
+            ewpot1_ = list()
+            ewpot1_.append(contract('ijx,i->jx', qm_ewald_hess[1], charges))
+            ewpot1_.append(contract('ijxy,jy->ix', qm_ewald_hess[2], dips))
+            ewpot2_ = list()
+            ewpot2_.append(contract('ijxy,j->ixy', qm_ewald_hess[3], charges))
+            if self.mm_mol.enable_octupole:
+                ewpot0_.append(contract('ijxyz,jxyz->i', qm_ewald_hess[5], octus))
+                ewpot1_.append(contract('ijxyz,jyz->ix', qm_ewald_hess[4], quads))
+                ewpot2_.append(contract('ijxyz,iz->ixy', qm_ewald_hess[4], dips))
+                ewpot3_ = list()
+                ewpot3_.append(contract('ijxyz,i->jxyz', qm_ewald_hess[5], charges))
+            if self.mm_mol.enable_octupole:
+                return ewpot0, ewpot1, ewpot2, ewpot3, ewpot0_, ewpot1_, ewpot2_, ewpot3_
+            else:
+                return ewpot0, ewpot1, ewpot2, ewpot0_, ewpot1_, ewpot2_
+        else:
+            if self.mm_mol.enable_octupole:
+                return ewpot0, ewpot1, ewpot2, ewpot3
+            else:
+                return ewpot0, ewpot1, ewpot2
 
     def get_hcore(self, mol=None):
         cput0 = (logger.process_clock(), logger.perf_counter())
@@ -308,6 +342,23 @@ class QMMMSCF(QMMM):
                 -contract('uv,xyvu->xy', dm[p0:p1], s1rr[iatm]))
         return cp.asarray(qm_quadrupoles)
 
+    def get_s1rrr(self):
+        if self.s1rrr is None:
+            cput0 = (logger.process_clock(), logger.perf_counter())
+            self.s1rrr = list()
+            mol = self.mol
+            nao = mol.nao
+            bas_atom = mol._bas[:,gto.ATOM_OF]
+            for i in range(self.mol.natm):
+                b0, b1 = np.where(bas_atom == i)[0][[0,-1]]
+                shls_slice = (0, mol.nbas, b0, b1+1)
+                with mol.with_common_orig(mol.atom_coord(i)):
+                    s1rrr = mol.intor('int1e_rrr', shls_slice=shls_slice)
+                    s1rrr = s1rrr.reshape((3,3,3,nao,-1))
+                    self.s1rrr.append(cp.asarray(s1rrr))
+            logger.timer(self, 'get_s1rrr', *cput0)
+        return self.s1rrr
+
     def get_vdiff(self, mol, ewald_pot):
         '''
         vdiff_uv = d Q_I / d dm_uv ewald_pot[0]_I
@@ -318,6 +369,8 @@ class QMMMSCF(QMMM):
         ovlp = self.get_ovlp()
         s1r  = self.get_s1r()
         s1rr = self.get_s1rr()
+        if self.mm_mol.enable_octupole:
+            s1rrr = self.get_s1rrr()
         aoslices = mol.aoslice_by_atom()
         for iatm in range(mol.natm):
             v0 = cp.asarray(ewald_pot[0][iatm])
@@ -327,6 +380,9 @@ class QMMMSCF(QMMM):
             vdiff[:,p0:p1] -= v0 * ovlp[:,p0:p1]
             vdiff[:,p0:p1] -= contract('x,xuv->uv', v1, s1r[iatm])
             vdiff[:,p0:p1] -= contract('xy,xyuv->uv', v2, s1rr[iatm])
+            if self.mm_mol.enable_octupole:
+                v3 = cp.asarray(ewald_pot[3][iatm])
+                vdiff[:,p0:p1] -= contract('xyz,xyzuv->uv', v3, s1rrr[iatm])
         vdiff = (vdiff + vdiff.T) / 2
         return vdiff
 
@@ -353,10 +409,17 @@ class QMMMSCF(QMMM):
                 qm_ewald_pot = self.get_qm_ewald_pot(mol, dm)
                 logger.timer(self, 'get_qm_ewald_pot', *cput0)
 
-        ewald_pot = \
-            mm_ewald_pot[0] + qm_ewald_pot[0], \
-            mm_ewald_pot[1] + qm_ewald_pot[1], \
-            mm_ewald_pot[2] + qm_ewald_pot[2]
+        if self.mm_mol.enable_octupole:
+            ewald_pot = \
+                mm_ewald_pot[0] + qm_ewald_pot[0], \
+                mm_ewald_pot[1] + qm_ewald_pot[1], \
+                mm_ewald_pot[2] + qm_ewald_pot[2], \
+                mm_ewald_pot[3] + qm_ewald_pot[3]
+        else:
+            ewald_pot = \
+                mm_ewald_pot[0] + qm_ewald_pot[0], \
+                mm_ewald_pot[1] + qm_ewald_pot[1], \
+                mm_ewald_pot[2] + qm_ewald_pot[2]
         vdiff = self.get_vdiff(mol, ewald_pot)
 
         if vhf_last is not None and isinstance(vhf_last, cupy_helper.CPArrayWithTag):
@@ -400,6 +463,56 @@ class QMMMSCF(QMMM):
         ewald_pot = mm_ewald_pot[2] + qm_ewald_pot[2] / 2
         e += contract('ixy,ixy->', cp.asarray(ewald_pot), self.get_qm_quadrupoles(dm))
         # TODO add energy correction if sum(charges) !=0 ?
+        if self.mm_mol.enable_octupole:
+            ewald_pot = mm_ewald_pot[3] + qm_ewald_pot[3] / 2
+            e += contract('ixyz,ixyz->', cp.asarray(ewald_pot), get_qm_octupoles(self.mol, dm))
+        if self.mm_mol.energy_decomp:
+            qm_charges = self.get_qm_charges(dm)
+            qm_dipoles = self.get_qm_dipoles(dm)
+            qm_quadrupoles = self.get_qm_quadrupoles(dm)
+            if self.mm_mol.enable_octupole:
+                qm_octupoles = get_qm_octupoles(self.mol, dm)
+            logger.note(self, '----- QM-MM energy decomposition -----')
+            # QM-MM:
+            logger.note(self, '----- QM-MM part -----')
+            logger.note(self, '--- Multipole order 0 ---')
+            e_ = contract('i,i->', cp.asarray(mm_ewald_pot[0]), qm_charges)
+            logger.note(self, f'mono-mono: {e_} ratio: {e_/e}')
+            logger.note(self, '--- Multipole order 1 ---')
+            e_ = contract('ix,ix->', cp.asarray(mm_ewald_pot[1]), qm_dipoles)
+            logger.note(self, f'dip-mono: {e_} ratio: {e_/e}')
+            logger.note(self, '--- Multipole order 2 ---')
+            e_ = contract('ixy,ixy->', cp.asarray(mm_ewald_pot[2]), qm_quadrupoles)
+            logger.note(self, f'quad-mono: {e_} ratio: {e_/e}')
+            shift = 3
+            if self.mm_mol.enable_octupole:
+                logger.note(self, '--- Multipole order 3 ---')
+                e_ = contract('ixyz,ixyz->', cp.asarray(mm_ewald_pot[3]), qm_octupoles)
+                logger.note(self, f'octu-mono: {e_} ratio: {e_/e}')
+                shift = 4
+            # QM-QM:
+            logger.note(self, '----- QM-QM part -----')
+            logger.note(self, '--- Multipole order 0 ---')
+            e_ = contract('i,i->', cp.asarray(qm_ewald_pot[shift][0] / 2), qm_charges)
+            logger.note(self, f'mono-mono: {e_} ratio: {e_/e}')
+            logger.note(self, '--- Multipole order 1 ---')
+            e_ = contract('i,i->', cp.asarray(qm_ewald_pot[shift][1] / 2), qm_charges) \
+                 + contract('ix,ix->', cp.asarray(qm_ewald_pot[shift+1][0] / 2), qm_dipoles)
+            logger.note(self, f'dip-mono: {e_} ratio: {e_/e}')
+            logger.note(self, '--- Multipole order 2 ---')
+            e_ = contract('ix,ix->', cp.asarray(qm_ewald_pot[shift+1][1] / 2), qm_dipoles)
+            logger.note(self, f'dip-dip: {e_} ratio: {e_/e}')
+            e_ = contract('i,i->', cp.asarray(qm_ewald_pot[shift][2] / 2), qm_charges) \
+                 + contract('ixy,ixy->', cp.asarray(qm_ewald_pot[shift+2][0] / 2), qm_quadrupoles)
+            logger.note(self, f'quad-mono: {e_} ratio: {e_/e}')
+            if self.mm_mol.enable_octupole:
+                logger.note(self, '--- Multipole order 3 ---')
+                e_ = contract('ix,ix->', cp.asarray(qm_ewald_pot[shift+1][2] / 2), qm_dipoles) \
+                     + contract('ixy,ixy->', cp.asarray(qm_ewald_pot[shift+2][1] / 2), qm_quadrupoles)
+                logger.note(self, f'quad-dip: {e_} ratio: {e_/e}')
+                e_ = contract('i,i->', cp.asarray(qm_ewald_pot[shift][3] / 2), qm_charges) \
+                     + contract('ixyz,ixyz->', cp.asarray(qm_ewald_pot[shift+3][0] / 2), qm_octupoles)
+                logger.note(self, f'octu-mono: {e_} ratio: {e_/e}')
         return e
 
     def energy_nuc(self):

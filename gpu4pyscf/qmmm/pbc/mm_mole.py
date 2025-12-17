@@ -113,6 +113,9 @@ class Cell(qmmm.mm_mole.Mole, pbc.gto.Cell):
         kmax = numpy.sqrt(3)*eta/2/numpy.pi * numpy.sqrt(lambertw( 4*Q**(2/3)/3/numpy.pi**(2/3)/L**2/eta**(2/3) / e**(4/3) ).real)
         self.mesh = numpy.ceil(numpy.diag(self.lattice_vectors()) * kmax).astype(int) * 2 + 1
 
+        self.enable_octupole = False
+        self.debug_self02 = False
+        self.energy_decomp = False
         self._built = True
 
     def get_lattice_Ls(self):
@@ -170,6 +173,8 @@ class Cell(qmmm.mm_mole.Mole, pbc.gto.Cell):
             ewovrl0 = cp.zeros(len(coords1))
             ewovrl1 = cp.zeros((len(coords1), 3))
             ewovrl2 = cp.zeros((len(coords1), 3, 3))
+            if self.enable_octupole:
+                ewovrl3 = cp.zeros((len(coords1), 3, 3, 3))
         else:
             ewovrl00 = cp.zeros((len(coords1), len(coords1)))
             ewovrl01 = cp.zeros((len(coords1), len(coords1), 3))
@@ -179,9 +184,17 @@ class Cell(qmmm.mm_mole.Mole, pbc.gto.Cell):
             ewself01 = cp.zeros((len(coords1), len(coords1), 3))
             ewself11 = cp.zeros((len(coords1), len(coords1), 3, 3))
             ewself02 = cp.zeros((len(coords1), len(coords1), 3, 3))
+            if self.enable_octupole:
+                ewovrl12 = cp.zeros((len(coords1), len(coords1), 3, 3, 3))
+                ewovrl03 = cp.zeros((len(coords1), len(coords1), 3, 3, 3))
+                ewself12 = cp.zeros((len(coords1), len(coords1), 3, 3, 3))
+                ewself03 = cp.zeros((len(coords1), len(coords1), 3, 3, 3))
 
         mem_avail = cupy_helper.get_avail_mem()
         blksize = int(mem_avail/64/3/len(all_coords2))
+        if self.enable_octupole:
+            # TODO: what is the correct blksize estimation when octupole is enabled?
+            blksize = int(mem_avail/64/3/3/len(all_coords2))
         if blksize == 0:
             raise RuntimeError(f"Not enough GPU memory, mem_avail = {mem_avail}, blkszie = {blksize}")
         for i0, i1 in lib.prange(0, len(coords1), blksize):
@@ -193,6 +206,8 @@ class Cell(qmmm.mm_mole.Mole, pbc.gto.Cell):
             # substract the real-space Coulomb within rcut_hcore
             mask = dist2 <= self.rcut_hcore**2
             Tij, Tija, Tijab = get_multipole_tensors_pp(R[:,mask], [0,1,2], r[:,mask])
+            if self.enable_octupole:
+                Tijabc = get_multipole_tensors_pp(R[:,mask], [3], r[:,mask])[0]
             if all_charges2 is not None:
                 charges = all_charges2[mask]
                 # ew0 = -d^2 E / dQi dqj qj
@@ -204,6 +219,9 @@ class Cell(qmmm.mm_mole.Mole, pbc.gto.Cell):
                 ewovrl1[i0:i1] += -contract('j,ija->ia', charges, Tija)
                 # qm quad - mm pc
                 ewovrl2[i0:i1] += -contract('j,ijab->iab', charges, Tijab) / 3
+                if self.enable_octupole:
+                    # qm octu - mm pc
+                    ewovrl3[i0:i1] += -contract('j,ijabc->iabc', charges, Tijabc) / 6
             else:
                 # NOTE a too small rcut_hcore truncates QM atoms, while this correction
                 # should be applied to all QM pairs regardless of rcut_hcore
@@ -217,6 +235,9 @@ class Cell(qmmm.mm_mole.Mole, pbc.gto.Cell):
                 ewovrl01[i0:i1] +=  Tija
                 ewovrl11[i0:i1] +=  Tijab
                 ewovrl02[i0:i1] += -Tijab / 3
+                if self.enable_octupole:
+                    ewovrl12[i0:i1] += -Tijabc / 3
+                    ewovrl03[i0:i1] +=  Tijabc / 6
 
             # difference between MM gaussain charges and MM point charges
             if all_charges2 is not None and self.charge_model == 'gaussian':
@@ -230,10 +251,15 @@ class Cell(qmmm.mm_mole.Mole, pbc.gto.Cell):
                 r_ = r[:,mask]
                 R_ = R[:,mask]
                 if expnts.size != 0:
-                    Tij, Tija, Tijab = get_multipole_tensors_pg(R_, expnts, [0,1,2], r_)
+                    if self.enable_octupole:
+                        Tij, Tija, Tijab, Tijabc = get_multipole_tensors_pg(R_, expnts, [0,1,2,3], r_)
+                    else:
+                        Tij, Tija, Tijab = get_multipole_tensors_pg(R_, expnts, [0,1,2], r_)
                     ewovrl0[i0:i1] -= contract('ij,j->i', Tij, all_charges2[mask])
                     ewovrl1[i0:i1] -= contract('j,ija->ia', all_charges2[mask], Tija)
                     ewovrl2[i0:i1] -= contract('j,ijab->iab', all_charges2[mask], Tijab) / 3
+                    if self.enable_octupole:
+                        ewovrl3[i0:i1] -= contract('j,ijabc->iabc', all_charges2[mask], Tijabc) / 6
 
             # ewald real-space sum
             if all_charges2 is not None:
@@ -247,12 +273,17 @@ class Cell(qmmm.mm_mole.Mole, pbc.gto.Cell):
                 # this is to ensure r and R will always have the shape of (i1-i0, L*num_qm)
                 r_ = r
                 R_ = R
-            Tij, Tija, Tijab = get_multipole_tensors_pg(R_, ew_eta, [0,1,2], r_)
+            if self.enable_octupole:
+                Tij, Tija, Tijab, Tijabc = get_multipole_tensors_pg(R_, ew_eta, [0,1,2,3], r_)
+            else:
+                Tij, Tija, Tijab = get_multipole_tensors_pg(R_, ew_eta, [0,1,2], r_)
 
             if all_charges2 is not None:
                 ewovrl0[i0:i1] += contract('ij,j->i', Tij, all_charges2_)
                 ewovrl1[i0:i1] += contract('j,ija->ia', all_charges2_, Tija)
                 ewovrl2[i0:i1] += contract('j,ijab->iab', all_charges2_, Tijab) / 3
+                if self.enable_octupole:
+                    ewovrl3[i0:i1] += contract('j,ijabc->iabc', all_charges2_, Tijabc) / 6
             else:
                 Tij = cp.sum(Tij.reshape(i1-i0, len(Lall), len(coords1)), axis=1)
                 Tija = cp.sum(Tija.reshape(i1-i0, len(Lall), len(coords1), 3), axis=1)
@@ -261,18 +292,30 @@ class Cell(qmmm.mm_mole.Mole, pbc.gto.Cell):
                 ewovrl01[i0:i1] -= Tija
                 ewovrl11[i0:i1] -= Tijab
                 ewovrl02[i0:i1] += Tijab / 3
+                if self.enable_octupole:
+                    Tijabc = cp.sum(Tijabc.reshape(i1-i0, len(Lall), len(coords1), 3, 3, 3), axis=1)
+                    ewovrl12[i0:i1] += Tijabc / 3
+                    ewovrl03[i0:i1] -= Tijabc / 6
             Tij = Tijab = None
 
             if all_charges2 is not None:
                 pass
             else:
                 ewself01[i0:i1] += 0
-                ewself02[i0:i1] += 0
+                ewself02[i0:i1] += 0 # why is this zero?
+                # This is set to zero because mono-quad self is always zero
+                # Debug: verify by explicitly calculating this term. In the end indeed it has zero effect
+                if self.debug_self02:
+                    ewself02[i0:i1] += contract('ij,ab->ijab', cp.eye(len(coords1))[i0:i1], cp.eye(3)) \
+                            * 4 * ew_eta**3 / 3 / cp.sqrt(cp.pi) / 3
                 # -d^2 Eself / dQi dQj
                 ewself00[i0:i1] += -cp.eye(len(coords1))[i0:i1] * 2 * ew_eta / cp.sqrt(cp.pi)
                 # -d^2 Eself / dDia dDjb
                 ewself11[i0:i1] += -contract('ij,ab->ijab', cp.eye(len(coords1))[i0:i1], cp.eye(3)) \
                         * 4 * ew_eta**3 / 3 / cp.sqrt(cp.pi)
+                if self.enable_octupole:
+                    ewself03[i0:i1] += 0
+                    ewself12[i0:i1] += 0
 
             r_ = R_ = all_charges2_ = None
 
@@ -302,9 +345,11 @@ class Cell(qmmm.mm_mole.Mole, pbc.gto.Cell):
             zcosGvR2 = contract("i,ig->g", charges2, cosGvR2)
             zsinGvR2 = contract("i,ig->g", charges2, sinGvR2)
             # qm pc - mm pc
+            # cos(G*R1) cos(G*R2) + sin(G*R1) sin(G*R2)
             ewg0  = contract('ig,g->i', cosGvR1, zcosGvR2 * Gpref)
             ewg0 += contract('ig,g->i', sinGvR1, zsinGvR2 * Gpref)
             # qm dip - mm pc
+            # cos(G*R1) sin(G*R2) - sin(G*R1) cos(G*R2)
             #p = ['einsum_path', (2, 3), (0, 2), (0, 1)]
             #ewg1  = contract('gx,ig,g,g->ix', Gv, cosGvR1, zsinGvR2, Gpref, optimize=p)
             #ewg1 -= contract('gx,ig,g,g->ix', Gv, sinGvR1, zcosGvR2, Gpref, optimize=p)
@@ -313,16 +358,26 @@ class Cell(qmmm.mm_mole.Mole, pbc.gto.Cell):
             tempGcR2  = contract('gx,g->gx', Gv, zcosGvR2 * Gpref)
             ewg1 -= contract('gx,ig->ix', tempGcR2, sinGvR1)
             # qm quad - mm pc
+            # - cos(G*R1) cos(G*R2) - sin(G*R1) sin (G*R2)
             #p = ['einsum_path', (3, 4), (0, 3), (0, 2), (0, 1)]
             #ewg2  = -contract('gx,gy,ig,g,g->ixy', Gv, Gv, cosGvR1, zcosGvR2, Gpref, optimize=p)
             #ewg2 += -contract('gx,gy,ig,g,g->ixy', Gv, Gv, sinGvR1, zsinGvR2, Gpref, optimize=p)
-            temp  =  contract('gx,gy->gxy', tempGcR2, Gv)
-            ewg2  = -contract('gxy,ig->ixy', temp, cosGvR1)
-            temp  =  contract('gx,gy->gxy', tempGsR2, Gv)
-            ewg2 += -contract('gxy,ig->ixy', temp, sinGvR1)
+            tempGcR3  =  contract('gx,gy->gxy', tempGcR2, Gv)
+            ewg2  = -contract('gxy,ig->ixy', tempGcR3, cosGvR1)
+            tempGsR3  =  contract('gx,gy->gxy', tempGsR2, Gv)
+            ewg2 += -contract('gxy,ig->ixy', tempGsR3, sinGvR1)
             ewg2 /= 3
+            if self.enable_octupole:
+                # qm octu - mm pc
+                # - cos(G*R1) sin(G*R2) + sin(G*R1) cos(G*R2)
+                temp  =  contract('gxy,gz->gxyz', tempGsR3, Gv)
+                ewg3  = -contract('gxyz,ig', temp, cosGvR1)
+                temp  =  contract('gxy,gz->gxyz', tempGcR3, Gv)
+                ewg3 +=  contract('gxyz,ig', temp, sinGvR1)
+                ewg3 /= 6
         else:
             # qm pc - qm pc
+            # cos(G*R1) cos(G*R2) + sin(G*R1) sin(G*R2)
             #ewg00  = contract('ig,jg,g->ij', cosGvR2, cosGvR2, Gpref)
             #ewg00 += contract('ig,jg,g->ij', sinGvR2, sinGvR2, Gpref)
             temp   = contract('ig,g->ig', cosGvR2, Gpref)
@@ -330,6 +385,7 @@ class Cell(qmmm.mm_mole.Mole, pbc.gto.Cell):
             temp   = contract('ig,g->ig', sinGvR2, Gpref)
             ewg00 += contract('ig,jg->ij', temp, sinGvR2)
             # qm pc - qm dip
+            # -1 * (cos(G*R1) sin(G*R2) - sin(G*R1) cos(G*R2))
             #ewg01  = contract('gx,ig,jg,g->ijx', Gv, sinGvR2, cosGvR2, Gpref)
             #ewg01 -= contract('gx,ig,jg,g->ijx', Gv, cosGvR2, sinGvR2, Gpref)
             temp1   = contract('gx,g->gx', Gv, Gpref)
@@ -338,6 +394,7 @@ class Cell(qmmm.mm_mole.Mole, pbc.gto.Cell):
             temp   = contract('gx,ig->igx', temp1, cosGvR2)
             ewg01 -= contract('igx,jg->ijx', temp, sinGvR2)
             # qm dip - qm dip
+            # -1 * -1 * (cos(G*R1) cos(G*R2) + sin(G*R1) sin (G*R2))
             #ewg11  = contract('gx,gy,ig,jg,g->ijxy', Gv, Gv, cosGvR2, cosGvR2, Gpref)
             #ewg11 += contract('gx,gy,ig,jg,g->ijxy', Gv, Gv, sinGvR2, sinGvR2, Gpref)
             temp2   = contract('gx,gy->gxy', temp1, Gv)
@@ -348,17 +405,40 @@ class Cell(qmmm.mm_mole.Mole, pbc.gto.Cell):
             # qm pc - qm quad
             #ewg02  = -contract('gx,gy,ig,jg,g->ijxy', Gv, Gv, cosGvR2, cosGvR2, Gpref)
             #ewg02 += -contract('gx,gy,ig,jg,g->ijxy', Gv, Gv, sinGvR2, sinGvR2, Gpref)
+            # -1 * (cos(G*R1) cos(G*R2) + sin(G*R1) sin (G*R2))
             ewg02 = -ewg11 / 3
+            if self.enable_octupole:
+                # qm dip - qm quad
+                # sin(G*R1) cos(G*R2) - cos(G*R1) sin(G*R2)
+                temp3  = contract('gxy,gz->gxyz', temp2, Gv)
+                temp   = contract('gxyz,ig->igxyz', temp3, sinGvR2)
+                ewg12  = contract('igxyz,jg->ijxyz', temp, cosGvR2)
+                temp   = contract('gxyz,ig->igxyz', temp3, cosGvR2)
+                ewg12 -= contract('igxyz,jg->ijxyz', temp, sinGvR2)
+                ewg12  = ewg12 / 3
+                # qm pc - qm octu
+                ewg03 = -ewg12 / 2
 
-        temp = tempGcR2 = tempGsR2 = temp1 = temp2 = None
+        temp = tempGcR2 = tempGsR2 = tempGcR3 = tempGsR3 = temp1 = temp2 = temp3 = None
 
         if charges2 is not None:
-            return ewovrl0 + ewg0, ewovrl1 + ewg1, ewovrl2 + ewg2
+            if self.enable_octupole:
+                return ewovrl0 + ewg0, ewovrl1 + ewg1, ewovrl2 + ewg2, ewovrl3 + ewg3
+            else:
+                return ewovrl0 + ewg0, ewovrl1 + ewg1, ewovrl2 + ewg2
         else:
-            return ewovrl00 + ewself00 + ewg00, \
-                   ewovrl01 + ewself01 + ewg01, \
-                   ewovrl11 + ewself11 + ewg11, \
-                   ewovrl02 + ewself02 + ewg02
+            if self.enable_octupole:
+                return ewovrl00 + ewself00 + ewg00, \
+                       ewovrl01 + ewself01 + ewg01, \
+                       ewovrl11 + ewself11 + ewg11, \
+                       ewovrl02 + ewself02 + ewg02, \
+                       ewovrl12 + ewself12 + ewg12, \
+                       ewovrl03 + ewself03 + ewg03
+            else:
+                return ewovrl00 + ewself00 + ewg00, \
+                       ewovrl01 + ewself01 + ewg01, \
+                       ewovrl11 + ewself11 + ewg11, \
+                       ewovrl02 + ewself02 + ewg02
 
 def create_mm_mol(atoms_or_coords, a, charges=None, radii=None,
         rcut_ewald=None, rcut_hcore=None, unit='Angstrom'):
