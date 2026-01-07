@@ -97,6 +97,7 @@ def qmmm_for_scf(method, mm_mol):
         if isinstance(method, QMMM):
             method.mm_mol = mm_mol
             method.pop_method = 'mulliken'
+            method.pre_orth_ao = None
             method.c_orth = None
             method.s1r = None
             method.s1rr = None
@@ -119,7 +120,7 @@ class QMMM:
 _QMMM = QMMM
 
 class QMMMSCF(QMMM):
-    _keys = {'mm_mol', 'pop_method', 'c_orth', 's1r', 's1rr', 's1rrr',
+    _keys = {'mm_mol', 'pop_method', 'pre_orth_ao', 'c_orth', 's1r', 's1rr', 's1rrr',
              'mm_ewald_pot', 'qm_ewald_hess', 'e_nuc'}
 
     to_cpu     = NotImplemented
@@ -129,6 +130,7 @@ class QMMMSCF(QMMM):
         self.__dict__.update(method.__dict__)
         self.mm_mol = mm_mol
         self.pop_method = 'mulliken'
+        self.pre_orth_ao = None
         self.c_orth = None
         self.s1r = None
         self.s1rr = None
@@ -292,7 +294,8 @@ class QMMMSCF(QMMM):
         dmS = cp.dot(dm, cp.asarray(self.get_ovlp()))
         if self.pop_method.lower() != 'mulliken':
             if self.c_orth is None:
-                self.c_orth = cp.asarray(orth.orth_ao(self.mol, method=self.pop_method))
+                self.c_orth = cp.asarray(orth.orth_ao(self.mol, method=self.pop_method,
+                                                      pre_orth_ao=self.pre_orth_ao))
             s = cp.asarray(self.get_ovlp())
             c_inv = self.c_orth.conj().T.dot(s)
             dmS = reduce(cp.dot, (c_inv, dmS, self.c_orth))
@@ -317,7 +320,8 @@ class QMMMSCF(QMMM):
                             cp.asarray(mol.intor('int1e_r', shls_slice=shls_slice)))
             else:
                 if self.c_orth is None:
-                    self.c_orth = cp.asarray(orth.orth_ao(mol, method=self.pop_method))
+                    self.c_orth = cp.asarray(orth.orth_ao(self.mol, method=self.pop_method,
+                                                          pre_orth_ao=self.pre_orth_ao))
                 with mol.with_common_orig((0.0, 0.0, 0.0)):
                     r_ao = cp.asarray(mol.intor('int1e_r'))
                 temp = contract('xuv,vq->xuq', r_ao, self.c_orth)
@@ -340,7 +344,8 @@ class QMMMSCF(QMMM):
         dm = cp.asarray(dm)
         if self.pop_method.lower() != 'mulliken':
             if self.c_orth is None:
-                self.c_orth = cp.asarray(orth.orth_ao(self.mol, method=self.pop_method))
+                self.c_orth = cp.asarray(orth.orth_ao(self.mol, method=self.pop_method,
+                                                      pre_orth_ao=self.pre_orth_ao))
             s = cp.asarray(self.get_ovlp())
             c_inv = self.c_orth.conj().T.dot(s)
             c_inv_H = s.dot(self.c_orth)
@@ -379,7 +384,8 @@ class QMMMSCF(QMMM):
                         self.s1rr.append(cp.asarray(s1rr_))
             else:
                 if self.c_orth is None:
-                    self.c_orth = cp.asarray(orth.orth_ao(mol, method=self.pop_method))
+                    self.c_orth = cp.asarray(orth.orth_ao(self.mol, method=self.pop_method,
+                                                          pre_orth_ao=self.pre_orth_ao))
                 with mol.with_common_orig((0.0, 0.0, 0.0)):
                     r_ao = cp.asarray(mol.intor('int1e_r'))
                     rr_ao = cp.asarray(mol.intor('int1e_rr'))
@@ -413,7 +419,8 @@ class QMMMSCF(QMMM):
         dm = cp.asarray(dm)
         if self.pop_method.lower() != 'mulliken':
             if self.c_orth is None:
-                self.c_orth = cp.asarray(orth.orth_ao(self.mol, method=self.pop_method))
+                self.c_orth = cp.asarray(orth.orth_ao(self.mol, method=self.pop_method,
+                                                      pre_orth_ao=self.pre_orth_ao))
             s = cp.asarray(self.get_ovlp())
             c_inv = self.c_orth.conj().T.dot(s)
             c_inv_H = s.dot(self.c_orth)
@@ -445,7 +452,8 @@ class QMMMSCF(QMMM):
                         self.s1rrr.append(cp.asarray(s1rrr))
             else:
                 if self.c_orth is None:
-                    self.c_orth = cp.asarray(orth.orth_ao(self.mol, method=self.pop_method))
+                    self.c_orth = cp.asarray(orth.orth_ao(self.mol, method=self.pop_method,
+                                                          pre_orth_ao=self.pre_orth_ao))
                 with mol.with_common_orig((0.0, 0.0, 0.0)):
                     r_ao = cp.asarray(mol.intor('int1e_r'))
                     rr_ao = cp.asarray(mol.intor('int1e_rr'))
@@ -485,7 +493,8 @@ class QMMMSCF(QMMM):
         dm = cp.asarray(dm)
         if self.pop_method.lower() != 'mulliken':
             if self.c_orth is None:
-                self.c_orth = cp.asarray(orth.orth_ao(self.mol, method=self.pop_method))
+                self.c_orth = cp.asarray(orth.orth_ao(self.mol, method=self.pop_method,
+                                                      pre_orth_ao=self.pre_orth_ao))
             s = cp.asarray(self.get_ovlp())
             c_inv = self.c_orth.conj().T.dot(s)
             c_inv_H = s.dot(self.c_orth)
@@ -531,7 +540,8 @@ class QMMMSCF(QMMM):
                     vdiff[:,p0:p1] -= contract('xyz,xyzuv->uv', v3, s1rrr[iatm])
         else:
             if self.c_orth is None:
-                self.c_orth = cp.asarray(orth.orth_ao(self.mol, method=self.pop_method))
+                self.c_orth = cp.asarray(orth.orth_ao(self.mol, method=self.pop_method,
+                                                      pre_orth_ao=self.pre_orth_ao))
             s = cp.asarray(self.get_ovlp())
             c_inv = self.c_orth.conj().T.dot(s)
             c_inv_H = s.dot(self.c_orth)
