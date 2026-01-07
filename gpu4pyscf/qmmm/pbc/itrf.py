@@ -15,19 +15,20 @@
 # Author: Chenghan Li <lch004218@gmail.com>
 
 import numpy as np
+from functools import reduce
 import pyscf
 from pyscf import lib
 from pyscf import gto
 from pyscf import df
 from pyscf import grad
 from pyscf.lib import logger
+from pyscf.lo import orth
 
 import cupy as cp
 from gpu4pyscf import scf
 from gpu4pyscf.qmmm.pbc import mm_mole
 from gpu4pyscf.lib import cupy_helper
 from gpu4pyscf.qmmm.pbc.tools import get_multipole_tensors_pp, get_multipole_tensors_pg
-from gpu4pyscf.qmmm.pbc.tools import get_qm_octupoles
 from gpu4pyscf.gto.int3c1e import int1e_grids
 from gpu4pyscf.gto.int3c1e_ip import int1e_grids_ip1, int1e_grids_ip2
 
@@ -95,6 +96,8 @@ def qmmm_for_scf(method, mm_mol):
         # Avoid to initialize QMMM twice
         if isinstance(method, QMMM):
             method.mm_mol = mm_mol
+            method.pop_method = 'mulliken'
+            method.c_orth = None
             method.s1r = None
             method.s1rr = None
             method.s1rrr = None
@@ -116,7 +119,8 @@ class QMMM:
 _QMMM = QMMM
 
 class QMMMSCF(QMMM):
-    _keys = {'mm_mol', 's1r', 's1rr', 's1rrr', 'mm_ewald_pot', 'qm_ewald_hess', 'e_nuc'}
+    _keys = {'mm_mol', 'pop_method', 'c_orth', 's1r', 's1rr', 's1rrr',
+             'mm_ewald_pot', 'qm_ewald_hess', 'e_nuc'}
 
     to_cpu     = NotImplemented
     as_scanner = NotImplemented
@@ -124,6 +128,8 @@ class QMMMSCF(QMMM):
     def __init__(self, method, mm_mol):
         self.__dict__.update(method.__dict__)
         self.mm_mol = mm_mol
+        self.pop_method = 'mulliken'
+        self.c_orth = None
         self.s1r = None
         self.s1rr = None
         self.s1rrr = None
@@ -166,7 +172,7 @@ class QMMMSCF(QMMM):
         if self.mm_mol.multipole_order > 1:
             quads = self.get_qm_quadrupoles(dm)
         if self.mm_mol.multipole_order > 2:
-            octus = get_qm_octupoles(self.mol, dm)
+            octus = self.get_qm_octupoles(dm)
         ewpot0  = contract('ij,j->i', qm_ewald_hess[0], charges)
         if self.mm_mol.multipole_order > 0:
             ewpot0 += contract('ijx,jx->i', qm_ewald_hess[1], dips)
@@ -284,6 +290,12 @@ class QMMMSCF(QMMM):
         aoslices = self.mol.aoslice_by_atom()
         chg = self.mol.atom_charges()
         dmS = cp.dot(dm, cp.asarray(self.get_ovlp()))
+        if self.pop_method.lower() != 'mulliken':
+            if self.c_orth is None:
+                self.c_orth = cp.asarray(orth.orth_ao(self.mol, method=self.pop_method))
+            s = cp.asarray(self.get_ovlp())
+            c_inv = self.c_orth.conj().T.dot(s)
+            dmS = reduce(cp.dot, (c_inv, dmS, self.c_orth))
         qm_charges = list()
         for iatm in range(self.mol.natm):
             p0, p1 = aoslices[iatm, 2:]
@@ -295,13 +307,30 @@ class QMMMSCF(QMMM):
             cput0 = (logger.process_clock(), logger.perf_counter())
             self.s1r = list()
             mol = self.mol
-            bas_atom = mol._bas[:,gto.ATOM_OF]
-            for i in range(self.mol.natm):
-                b0, b1 = np.where(bas_atom == i)[0][[0,-1]]
-                shls_slice = (0, mol.nbas, b0, b1+1)
-                with mol.with_common_orig(mol.atom_coord(i)):
-                    self.s1r.append(
-                        cp.asarray(mol.intor('int1e_r', shls_slice=shls_slice)))
+            if self.pop_method.lower() == 'mulliken':
+                bas_atom = mol._bas[:,gto.ATOM_OF]
+                for i in range(self.mol.natm):
+                    b0, b1 = np.where(bas_atom == i)[0][[0,-1]]
+                    shls_slice = (0, mol.nbas, b0, b1+1)
+                    with mol.with_common_orig(mol.atom_coord(i)):
+                        self.s1r.append(
+                            cp.asarray(mol.intor('int1e_r', shls_slice=shls_slice)))
+            else:
+                if self.c_orth is None:
+                    self.c_orth = cp.asarray(orth.orth_ao(mol, method=self.pop_method))
+                with mol.with_common_orig((0.0, 0.0, 0.0)):
+                    r_ao = cp.asarray(mol.intor('int1e_r'))
+                temp = contract('xuv,vq->xuq', r_ao, self.c_orth)
+                r_orth = contract('up,xuq->xpq', self.c_orth.conj(), temp)
+                aoslices = mol.aoslice_by_atom()
+                for i in range(mol.natm):
+                    p0, p1 = aoslices[i, 2:]
+                    coord = cp.asarray(mol.atom_coord(i))
+                    ri = r_orth[:, :, p0:p1].copy()
+                    eye = cp.eye(p1-p0, dtype=ri.dtype)
+                    for x in range(ri.shape[0]):
+                        ri[x, p0:p1, :] -= coord[x] * eye
+                    self.s1r.append(ri)
             logger.timer(self, 'get_s1r', *cput0)
         return self.s1r
 
@@ -309,6 +338,13 @@ class QMMMSCF(QMMM):
         if dm.ndim == 3:
             dm = dm[0] + dm[1]
         dm = cp.asarray(dm)
+        if self.pop_method.lower() != 'mulliken':
+            if self.c_orth is None:
+                self.c_orth = cp.asarray(orth.orth_ao(self.mol, method=self.pop_method))
+            s = cp.asarray(self.get_ovlp())
+            c_inv = self.c_orth.conj().T.dot(s)
+            c_inv_H = s.dot(self.c_orth)
+            dm = reduce(cp.dot, (c_inv, s, c_inv_H))
         if s1r is None:
             s1r = self.get_s1r()
         aoslices = self.mol.aoslice_by_atom()
@@ -328,18 +364,46 @@ class QMMMSCF(QMMM):
             self.s1rr = list()
             mol = self.mol
             nao = mol.nao
-            bas_atom = mol._bas[:,gto.ATOM_OF]
-            for i in range(self.mol.natm):
-                b0, b1 = np.where(bas_atom == i)[0][[0,-1]]
-                shls_slice = (0, mol.nbas, b0, b1+1)
-                with mol.with_common_orig(mol.atom_coord(i)):
-                    s1rr_ = mol.intor('int1e_rr', shls_slice=shls_slice)
-                    s1rr_ = s1rr_.reshape((3,3,nao,-1))
-                    s1rr_trace = lib.einsum('xxuv->uv', s1rr_)
-                    s1rr_ = 3/2 * s1rr_
-                    for k in range(3):
-                        s1rr_[k,k] -= 0.5 * s1rr_trace
-                    self.s1rr.append(cp.asarray(s1rr_))
+            if self.pop_method.lower() == 'mulliken':
+                bas_atom = mol._bas[:,gto.ATOM_OF]
+                for i in range(self.mol.natm):
+                    b0, b1 = np.where(bas_atom == i)[0][[0,-1]]
+                    shls_slice = (0, mol.nbas, b0, b1+1)
+                    with mol.with_common_orig(mol.atom_coord(i)):
+                        s1rr_ = mol.intor('int1e_rr', shls_slice=shls_slice)
+                        s1rr_ = s1rr_.reshape((3,3,nao,-1))
+                        s1rr_trace = lib.einsum('xxuv->uv', s1rr_)
+                        s1rr_ = 3/2 * s1rr_
+                        for k in range(3):
+                            s1rr_[k,k] -= 0.5 * s1rr_trace
+                        self.s1rr.append(cp.asarray(s1rr_))
+            else:
+                if self.c_orth is None:
+                    self.c_orth = cp.asarray(orth.orth_ao(mol, method=self.pop_method))
+                with mol.with_common_orig((0.0, 0.0, 0.0)):
+                    r_ao = cp.asarray(mol.intor('int1e_r'))
+                    rr_ao = cp.asarray(mol.intor('int1e_rr'))
+                temp = contract('xuv,vq->xuq', r_ao, self.c_orth)
+                r_orth = contract('up,xuq->xpq', self.c_orth.conj(), temp)
+                temp = contract('xuv,vq->xuq', rr_ao, self.c_orth)
+                rr_orth = contract('up,xuq->xpq', self.c_orth.conj(), temp)
+                aoslices = mol.aoslice_by_atom()
+                for i in range(mol.natm):
+                    p0, p1 = aoslices[i, 2:]
+                    coord = cp.asarray(mol.atom_coord(i))
+                    ri = r_orth[:, :, p0:p1]
+                    rri = rr_orth[:, :, p0:p1].copy().reshape(3,3,nao,-1)
+                    rri -= coord[:, None, None, None] * ri[None, :, :, :]
+                    rri -= coord[None, :, None, None] * ri[:, None, :, :]
+                    eye = cp.eye(p1-p0, dtype=rri.dtype)
+                    for x in range(rri.shape[0]):
+                        for y in range(rri.shape[1]):
+                            rri[x, y, p0:p1, :] += coord[x] * coord[y] * eye
+                    rr_trace = cp.einsum('xxuv->uv', rri)
+                    rri = 3/2 * rri
+                    for x in range(rri.shape[0]):
+                        rri[x, x] -= 0.5 * rr_trace
+                    self.s1rr.append(rri)
             logger.timer(self, 'get_s1rr', *cput0)
         return self.s1rr
 
@@ -347,6 +411,13 @@ class QMMMSCF(QMMM):
         if dm.ndim == 3:
             dm = dm[0] + dm[1]
         dm = cp.asarray(dm)
+        if self.pop_method.lower() != 'mulliken':
+            if self.c_orth is None:
+                self.c_orth = cp.asarray(orth.orth_ao(self.mol, method=self.pop_method))
+            s = cp.asarray(self.get_ovlp())
+            c_inv = self.c_orth.conj().T.dot(s)
+            c_inv_H = s.dot(self.c_orth)
+            dm = reduce(cp.dot, (c_inv, s, c_inv_H))
         if s1rr is None:
             s1rr = self.get_s1rr()
         aoslices = self.mol.aoslice_by_atom()
@@ -363,16 +434,71 @@ class QMMMSCF(QMMM):
             self.s1rrr = list()
             mol = self.mol
             nao = mol.nao
-            bas_atom = mol._bas[:,gto.ATOM_OF]
-            for i in range(self.mol.natm):
-                b0, b1 = np.where(bas_atom == i)[0][[0,-1]]
-                shls_slice = (0, mol.nbas, b0, b1+1)
-                with mol.with_common_orig(mol.atom_coord(i)):
-                    s1rrr = mol.intor('int1e_rrr', shls_slice=shls_slice)
-                    s1rrr = s1rrr.reshape((3,3,3,nao,-1))
-                    self.s1rrr.append(cp.asarray(s1rrr))
+            if self.pop_method.lower() == 'mulliken':
+                bas_atom = mol._bas[:,gto.ATOM_OF]
+                for i in range(self.mol.natm):
+                    b0, b1 = np.where(bas_atom == i)[0][[0,-1]]
+                    shls_slice = (0, mol.nbas, b0, b1+1)
+                    with mol.with_common_orig(mol.atom_coord(i)):
+                        s1rrr = mol.intor('int1e_rrr', shls_slice=shls_slice)
+                        s1rrr = s1rrr.reshape((3,3,3,nao,-1))
+                        self.s1rrr.append(cp.asarray(s1rrr))
+            else:
+                if self.c_orth is None:
+                    self.c_orth = cp.asarray(orth.orth_ao(self.mol, method=self.pop_method))
+                with mol.with_common_orig((0.0, 0.0, 0.0)):
+                    r_ao = cp.asarray(mol.intor('int1e_r'))
+                    rr_ao = cp.asarray(mol.intor('int1e_rr'))
+                    rrr_ao = cp.asarray(mol.intor('int1e_rrr'))
+                temp = contract('xuv,vq->xuq', r_ao, self.c_orth)
+                r_orth = contract('up,xuq->xpq', self.c_orth.conj(), temp)
+                temp = contract('xuv,vq->xuq', rr_ao, self.c_orth)
+                rr_orth = contract('up,xuq->xpq', self.c_orth.conj(), temp)
+                temp = contract('xuv,vq->xuq', rrr_ao, self.c_orth)
+                rrr_orth = contract('up,xuq->xpq', self.c_orth.conj(), temp)
+                aoslices = mol.aoslice_by_atom()
+                for i in range(mol.natm):
+                    p0, p1 = aoslices[i, 2:]
+                    coord = cp.asarray(mol.atom_coord(i))
+                    ri = r_orth[:, :, p0:p1]
+                    rri = rr_orth[:, :, p0:p1].reshape(3,3,nao,-1)
+                    rrri = rrr_orth[:, :, p0:p1].copy().reshape(3,3,3,nao,-1)
+                    rrri -= coord[:, None, None, None, None] * rri[None, :, :, :, :]
+                    rrri -= coord[None, :, None, None, None] * rri[:, None, :, :, :]
+                    rrri -= coord[None, None, :, None, None] * rri[:, :, None, :, :]
+                    rrri += coord[:, None, None, None, None] * coord[None, :, None, None, None] \
+                            * ri[None, None, :, :, :]
+                    rrri += coord[:, None, None, None, None] * coord[None, None, :, None, None] \
+                            * ri[None, :, None, :, :]
+                    rrri += coord[None, :, None, None, None] * coord[None, None, :, None, None] \
+                            * ri[:, None, None, :, :]
+                    eye = cp.eye(p1-p0, dtype=rrri.dtype)
+                    for x in range(rrri.shape[0]):
+                        for y in range(rrri.shape[1]):
+                            for z in range(rrri.shape[2]):
+                                rrri[x, y, z, p0:p1, :] -= coord[x] * coord[y] * coord[z] * eye
+                    self.s1rrr.append(rrri)
             logger.timer(self, 'get_s1rrr', *cput0)
         return self.s1rrr
+
+    def get_qm_octupoles(self, dm, s1rrr=None):
+        dm = cp.asarray(dm)
+        if self.pop_method.lower() != 'mulliken':
+            if self.c_orth is None:
+                self.c_orth = cp.asarray(orth.orth_ao(self.mol, method=self.pop_method))
+            s = cp.asarray(self.get_ovlp())
+            c_inv = self.c_orth.conj().T.dot(s)
+            c_inv_H = s.dot(self.c_orth)
+            dm = reduce(cp.dot, (c_inv, s, c_inv_H))
+        if s1rrr is None:
+            s1rrr = self.get_s1rrr()
+        aoslices = self.mol.aoslice_by_atom()
+        qm_octupoles = list()
+        for iatm in range(self.mol.natm):
+            p0, p1 = aoslices[iatm, 2:]
+            qm_octupoles.append(
+                -contract('uv,xyzvu->xyz', dm[p0:p1], s1rrr[iatm]))
+        return cp.asarray(qm_octupoles)
 
     def get_vdiff(self, mol, ewald_pot):
         '''
@@ -389,19 +515,45 @@ class QMMMSCF(QMMM):
         if self.mm_mol.multipole_order > 2:
             s1rrr = self.get_s1rrr()
         aoslices = mol.aoslice_by_atom()
-        for iatm in range(mol.natm):
-            v0 = cp.asarray(ewald_pot[0][iatm])
-            p0, p1 = aoslices[iatm, 2:]
-            vdiff[:,p0:p1] -= v0 * ovlp[:,p0:p1]
-            if self.mm_mol.multipole_order > 0:
-                v1 = cp.asarray(ewald_pot[1][iatm])
-                vdiff[:,p0:p1] -= contract('x,xuv->uv', v1, s1r[iatm])
-            if self.mm_mol.multipole_order > 1:
-                v2 = cp.asarray(ewald_pot[2][iatm])
-                vdiff[:,p0:p1] -= contract('xy,xyuv->uv', v2, s1rr[iatm])
-            if self.mm_mol.multipole_order > 2:
-                v3 = cp.asarray(ewald_pot[3][iatm])
-                vdiff[:,p0:p1] -= contract('xyz,xyzuv->uv', v3, s1rrr[iatm])
+        if self.pop_method.lower() == 'mulliken':
+            for iatm in range(mol.natm):
+                v0 = cp.asarray(ewald_pot[0][iatm])
+                p0, p1 = aoslices[iatm, 2:]
+                vdiff[:,p0:p1] -= v0 * ovlp[:,p0:p1]
+                if self.mm_mol.multipole_order > 0:
+                    v1 = cp.asarray(ewald_pot[1][iatm])
+                    vdiff[:,p0:p1] -= contract('x,xuv->uv', v1, s1r[iatm])
+                if self.mm_mol.multipole_order > 1:
+                    v2 = cp.asarray(ewald_pot[2][iatm])
+                    vdiff[:,p0:p1] -= contract('xy,xyuv->uv', v2, s1rr[iatm])
+                if self.mm_mol.multipole_order > 2:
+                    v3 = cp.asarray(ewald_pot[3][iatm])
+                    vdiff[:,p0:p1] -= contract('xyz,xyzuv->uv', v3, s1rrr[iatm])
+        else:
+            if self.c_orth is None:
+                self.c_orth = cp.asarray(orth.orth_ao(self.mol, method=self.pop_method))
+            s = cp.asarray(self.get_ovlp())
+            c_inv = self.c_orth.conj().T.dot(s)
+            c_inv_H = s.dot(self.c_orth)
+            for iatm in range(mol.natm):
+                v0 = cp.asarray(ewald_pot[0][iatm])
+                p0, p1 = aoslices[iatm, 2:]
+                vdiff -= v0 * contract('pu,vp->uv', c_inv[p0:p1], c_inv_H[:,p0:p1])
+                if self.mm_mol.multipole_order > 0:
+                    v1 = cp.asarray(ewald_pot[1][iatm])
+                    temp1 = contract('vq,xqp->xvp', c_inv_H, s1r[iatm])
+                    temp2 = contract('pu,xvp->xuv', c_inv[p0:p1], temp1)
+                    vdiff -= contract('x,xuv->uv', v1, temp2)
+                if self.mm_mol.multipole_order > 1:
+                    v2 = cp.asarray(ewald_pot[2][iatm])
+                    temp1 = contract('vq,xyqp->xyvp', c_inv_H, s1rr[iatm])
+                    temp2 = contract('pu,xyvp->xyuv', c_inv[p0:p1], temp1)
+                    vdiff -= contract('xy,xyuv->uv', v2, temp2)
+                if self.mm_mol.multipole_order > 2:
+                    v3 = cp.asarray(ewald_pot[3][iatm])
+                    temp1 = contract('vq,xyzqp->xyzvp', c_inv_H, s1rrr[iatm])
+                    temp2 = contract('pu,xyzvp->xyzuv', c_inv[p0:p1], temp1)
+                    vdiff -= contract('xyz,xyzuv->uv', v3, temp2)
         vdiff = (vdiff + vdiff.T) / 2
         return vdiff
 
@@ -476,7 +628,7 @@ class QMMMSCF(QMMM):
             e += contract('ixy,ixy->', cp.asarray(ewald_pot), self.get_qm_quadrupoles(dm))
         if self.mm_mol.multipole_order > 2:
             ewald_pot = mm_ewald_pot[3] + qm_ewald_pot[3] / 2
-            e += contract('ixyz,ixyz->', cp.asarray(ewald_pot), get_qm_octupoles(self.mol, dm))
+            e += contract('ixyz,ixyz->', cp.asarray(ewald_pot), self.get_qm_octupoles(dm))
         # TODO add energy correction if sum(charges) !=0 ?
         if self.mm_mol.energy_decomp:
             qm_charges = self.get_qm_charges(dm)
@@ -485,7 +637,7 @@ class QMMMSCF(QMMM):
             if self.mm_mol.multipole_order > 1:
                 qm_quads = self.get_qm_quadrupoles(dm)
             if self.mm_mol.multipole_order > 2:
-                qm_octus = get_qm_octupoles(self.mol, dm)
+                qm_octus = self.get_qm_octupoles(dm)
             logger.note(self, '----- QM-MM energy decomposition -----')
             # QM-MM:
             logger.note(self, '----- QM-MM part -----')
