@@ -97,7 +97,7 @@ def qmmm_for_scf(method, mm_mol):
         if isinstance(method, QMMM):
             method.mm_mol = mm_mol
             method.pop_method = 'mulliken'
-            method.pre_orth_ao = None
+            method.pre_orth_ao = 'ANO'
             method.c_orth = None
             method.s1r = None
             method.s1rr = None
@@ -130,7 +130,7 @@ class QMMMSCF(QMMM):
         self.__dict__.update(method.__dict__)
         self.mm_mol = mm_mol
         self.pop_method = 'mulliken'
-        self.pre_orth_ao = None
+        self.pre_orth_ao = 'ANO'
         self.c_orth = None
         self.s1r = None
         self.s1rr = None
@@ -322,6 +322,9 @@ class QMMMSCF(QMMM):
                 if self.c_orth is None:
                     self.c_orth = cp.asarray(orth.orth_ao(self.mol, method=self.pop_method,
                                                           pre_orth_ao=self.pre_orth_ao))
+                s = cp.asarray(self.get_ovlp())
+                # in principle for orth ao this s is eye, but make the code even work for mulliken
+                s = reduce(cp.dot, (self.c_orth.conj().T, s, self.c_orth))
                 with mol.with_common_orig((0.0, 0.0, 0.0)):
                     r_ao = cp.asarray(mol.intor('int1e_r'))
                 temp = contract('xuv,vq->xuq', r_ao, self.c_orth)
@@ -330,11 +333,8 @@ class QMMMSCF(QMMM):
                 for i in range(mol.natm):
                     p0, p1 = aoslices[i, 2:]
                     coord = cp.asarray(mol.atom_coord(i))
-                    ri = r_orth[:, :, p0:p1].copy()
-                    eye = cp.eye(p1-p0, dtype=ri.dtype)
-                    for x in range(ri.shape[0]):
-                        ri[x, p0:p1, :] -= coord[x] * eye
-                    self.s1r.append(ri)
+                    s1r_ = r_orth[:, :, p0:p1] - coord[:, None, None] * s[None, :, p0:p1]
+                    self.s1r.append(s1r_)
             logger.timer(self, 'get_s1r', *cput0)
         return self.s1r
 
@@ -386,6 +386,9 @@ class QMMMSCF(QMMM):
                 if self.c_orth is None:
                     self.c_orth = cp.asarray(orth.orth_ao(self.mol, method=self.pop_method,
                                                           pre_orth_ao=self.pre_orth_ao))
+                s = cp.asarray(self.get_ovlp())
+                # in principle for orth ao this s is eye, but make the code even work for mulliken
+                s = reduce(cp.dot, (self.c_orth.conj().T, s, self.c_orth))
                 with mol.with_common_orig((0.0, 0.0, 0.0)):
                     r_ao = cp.asarray(mol.intor('int1e_r'))
                     rr_ao = cp.asarray(mol.intor('int1e_rr'))
@@ -398,18 +401,16 @@ class QMMMSCF(QMMM):
                     p0, p1 = aoslices[i, 2:]
                     coord = cp.asarray(mol.atom_coord(i))
                     ri = r_orth[:, :, p0:p1]
-                    rri = rr_orth[:, :, p0:p1].copy().reshape(3,3,nao,-1)
-                    rri -= coord[:, None, None, None] * ri[None, :, :, :]
-                    rri -= coord[None, :, None, None] * ri[:, None, :, :]
-                    eye = cp.eye(p1-p0, dtype=rri.dtype)
-                    for x in range(rri.shape[0]):
-                        for y in range(rri.shape[1]):
-                            rri[x, y, p0:p1, :] += coord[x] * coord[y] * eye
-                    rr_trace = cp.einsum('xxuv->uv', rri)
-                    rri = 3/2 * rri
-                    for x in range(rri.shape[0]):
-                        rri[x, x] -= 0.5 * rr_trace
-                    self.s1rr.append(rri)
+                    s1rr_ = rr_orth[:, :, p0:p1].copy().reshape(3,3,nao,-1)
+                    s1rr_ -= coord[:, None, None, None] * ri[None, :, :, :]
+                    s1rr_ -= coord[None, :, None, None] * ri[:, None, :, :]
+                    s1rr_ += coord[:, None, None, None] * coord[None, :, None, None] \
+                             * s[None, None, :, p0:p1]
+                    rr_trace = cp.einsum('xxuv->uv', s1rr_)
+                    s1rr_ = 3/2 * s1rr_
+                    for x in range(s1rr_.shape[0]):
+                        s1rr_[x, x] -= 0.5 * rr_trace
+                    self.s1rr.append(s1rr_)
             logger.timer(self, 'get_s1rr', *cput0)
         return self.s1rr
 
@@ -454,6 +455,9 @@ class QMMMSCF(QMMM):
                 if self.c_orth is None:
                     self.c_orth = cp.asarray(orth.orth_ao(self.mol, method=self.pop_method,
                                                           pre_orth_ao=self.pre_orth_ao))
+                s = cp.asarray(self.get_ovlp())
+                # in principle for orth ao this s is eye, but make the code even work for mulliken
+                s = reduce(cp.dot, (self.c_orth.conj().T, s, self.c_orth))
                 with mol.with_common_orig((0.0, 0.0, 0.0)):
                     r_ao = cp.asarray(mol.intor('int1e_r'))
                     rr_ao = cp.asarray(mol.intor('int1e_rr'))
@@ -470,22 +474,19 @@ class QMMMSCF(QMMM):
                     coord = cp.asarray(mol.atom_coord(i))
                     ri = r_orth[:, :, p0:p1]
                     rri = rr_orth[:, :, p0:p1].reshape(3,3,nao,-1)
-                    rrri = rrr_orth[:, :, p0:p1].copy().reshape(3,3,3,nao,-1)
-                    rrri -= coord[:, None, None, None, None] * rri[None, :, :, :, :]
-                    rrri -= coord[None, :, None, None, None] * rri[:, None, :, :, :]
-                    rrri -= coord[None, None, :, None, None] * rri[:, :, None, :, :]
-                    rrri += coord[:, None, None, None, None] * coord[None, :, None, None, None] \
-                            * ri[None, None, :, :, :]
-                    rrri += coord[:, None, None, None, None] * coord[None, None, :, None, None] \
-                            * ri[None, :, None, :, :]
-                    rrri += coord[None, :, None, None, None] * coord[None, None, :, None, None] \
-                            * ri[:, None, None, :, :]
-                    eye = cp.eye(p1-p0, dtype=rrri.dtype)
-                    for x in range(rrri.shape[0]):
-                        for y in range(rrri.shape[1]):
-                            for z in range(rrri.shape[2]):
-                                rrri[x, y, z, p0:p1, :] -= coord[x] * coord[y] * coord[z] * eye
-                    self.s1rrr.append(rrri)
+                    s1rrr_ = rrr_orth[:, :, p0:p1].copy().reshape(3,3,3,nao,-1)
+                    s1rrr_ -= coord[:, None, None, None, None] * rri[None, :, :, :, :]
+                    s1rrr_ -= coord[None, :, None, None, None] * rri[:, None, :, :, :]
+                    s1rrr_ -= coord[None, None, :, None, None] * rri[:, :, None, :, :]
+                    s1rrr_ += coord[:, None, None, None, None] * coord[None, :, None, None, None] \
+                              * ri[None, None, :, :, :]
+                    s1rrr_ += coord[:, None, None, None, None] * coord[None, None, :, None, None] \
+                              * ri[None, :, None, :, :]
+                    s1rrr_ += coord[None, :, None, None, None] * coord[None, None, :, None, None] \
+                              * ri[:, None, None, :, :]
+                    s1rrr_ -= coord[:, None, None, None, None] * coord[None, :, None, None, None] \
+                              * coord[None, None, :, None, None] * s[None, None, None, :, p0:p1]
+                    self.s1rrr.append(s1rrr_)
             logger.timer(self, 'get_s1rrr', *cput0)
         return self.s1rrr
 
@@ -551,19 +552,19 @@ class QMMMSCF(QMMM):
                 vdiff -= v0 * contract('pu,vp->uv', c_inv[p0:p1], c_inv_H[:,p0:p1])
                 if self.mm_mol.multipole_order > 0:
                     v1 = cp.asarray(ewald_pot[1][iatm])
-                    temp1 = contract('vq,xqp->xvp', c_inv_H, s1r[iatm])
-                    temp2 = contract('pu,xvp->xuv', c_inv[p0:p1], temp1)
-                    vdiff -= contract('x,xuv->uv', v1, temp2)
+                    temp = contract('vq,xqp->xvp', c_inv_H, s1r[iatm])
+                    temp = contract('pu,xvp->xuv', c_inv[p0:p1], temp)
+                    vdiff -= contract('x,xuv->uv', v1, temp)
                 if self.mm_mol.multipole_order > 1:
                     v2 = cp.asarray(ewald_pot[2][iatm])
-                    temp1 = contract('vq,xyqp->xyvp', c_inv_H, s1rr[iatm])
-                    temp2 = contract('pu,xyvp->xyuv', c_inv[p0:p1], temp1)
-                    vdiff -= contract('xy,xyuv->uv', v2, temp2)
+                    temp = contract('vq,xyqp->xyvp', c_inv_H, s1rr[iatm])
+                    temp = contract('pu,xyvp->xyuv', c_inv[p0:p1], temp)
+                    vdiff -= contract('xy,xyuv->uv', v2, temp)
                 if self.mm_mol.multipole_order > 2:
                     v3 = cp.asarray(ewald_pot[3][iatm])
-                    temp1 = contract('vq,xyzqp->xyzvp', c_inv_H, s1rrr[iatm])
-                    temp2 = contract('pu,xyzvp->xyzuv', c_inv[p0:p1], temp1)
-                    vdiff -= contract('xyz,xyzuv->uv', v3, temp2)
+                    temp = contract('vq,xyzqp->xyzvp', c_inv_H, s1rrr[iatm])
+                    temp = contract('pu,xyzvp->xyzuv', c_inv[p0:p1], temp)
+                    vdiff -= contract('xyz,xyzuv->uv', v3, temp)
         vdiff = (vdiff + vdiff.T) / 2
         return vdiff
 
@@ -867,8 +868,8 @@ class QMMMGrad:
     def grad_ewald(self, dm=None, with_mm=False, mm_ewald_pot=None, qm_ewald_pot=None):
         '''PBC correction energy grad w.r.t. qm and mm atom positions
         '''
-        assert isinstance(self.base.mm_mol.multipole_order, int) \
-                and self.base.mm_mol.multipole_order in range(3)
+        if self.base.mm_mol.multipole_order > 2:
+            raise NotImplementedError('Gradients only support up to multipole order 2')
         cput0 = (logger.process_clock(), logger.perf_counter())
         if dm is None: dm = self.base.make_rdm1()
         if dm.ndim == 3:
@@ -901,35 +902,35 @@ class QMMMGrad:
                      for i in range(self.base.mm_mol.multipole_order+1)]
 
         dEds = cp.zeros((mol.nao, mol.nao))
-        if self.base.mm_mol.multipole_order > 0:
-            dEdsr = cp.zeros((3, mol.nao, mol.nao))
-        if self.base.mm_mol.multipole_order > 1:
-            dEdsrr = cp.zeros((3, 3, mol.nao, mol.nao))
         s1 = cp.asarray(self.get_ovlp(mol)) # = -mol.intor('int1e_ipovlp')
         if self.base.mm_mol.multipole_order > 0:
+            dEdsr = cp.zeros((3, mol.nao, mol.nao))
             s1r = list()
         if self.base.mm_mol.multipole_order > 1:
+            dEdsrr = cp.zeros((3, 3, mol.nao, mol.nao))
             s1rr = list()
-        bas_atom = mol._bas[:,gto.ATOM_OF]
-        for iatm in range(mol.natm):
-            v0 = cp.asarray(ewald_pot[0][iatm])
-            p0, p1 = aoslices[iatm, 2:]
-            dEds[p0:p1] -= v0 * dm[p0:p1]
-            if self.base.mm_mol.multipole_order > 0:
-                v1 = cp.asarray(ewald_pot[1][iatm])
-                dEdsr[:,p0:p1] -= contract('x,uv->xuv', v1, dm[p0:p1])
-            if self.base.mm_mol.multipole_order > 1:
-                v2 = cp.asarray(ewald_pot[2][iatm])
-                dEdsrr[:,:,p0:p1] -= contract('xy,uv->xyuv', v2, dm[p0:p1])
 
-            b0, b1 = np.where(bas_atom == iatm)[0][[0,-1]]
-            shlslc = (b0, b1+1, 0, mol.nbas)
-            if self.base.mm_mol.multipole_order > 0:
+        if self.base.pop_method.lower() == 'mulliken':
+            bas_atom = mol._bas[:,gto.ATOM_OF]
+            for iatm in range(mol.natm):
+                v0 = cp.asarray(ewald_pot[0][iatm])
+                p0, p1 = aoslices[iatm, 2:]
+                dEds[p0:p1] -= v0 * dm[p0:p1]
+                if self.base.mm_mol.multipole_order > 0:
+                    v1 = cp.asarray(ewald_pot[1][iatm])
+                    dEdsr[:,p0:p1] -= contract('x,uv->xuv', v1, dm[p0:p1])
+                if self.base.mm_mol.multipole_order > 1:
+                    v2 = cp.asarray(ewald_pot[2][iatm])
+                    dEdsrr[:,:,p0:p1] -= contract('xy,uv->xyuv', v2, dm[p0:p1])
+
+                b0, b1 = np.where(bas_atom == iatm)[0][[0,-1]]
+                shlslc = (b0, b1+1, 0, mol.nbas)
                 with mol.with_common_orig(qm_coords[iatm].get()):
-                    # s1r[a,x,u,v] = \int phi_u (r_a-Ri_a) (-\nabla_x phi_v) dr
-                    s1r.append(
-                        cp.asarray(-mol.intor('int1e_irp', shls_slice=shlslc).
-                                   reshape(3, 3, -1, mol.nao)))
+                    if self.base.mm_mol.multipole_order > 0:
+                        # s1r[a,x,u,v] = \int phi_u (r_a-Ri_a) (-\nabla_x phi_v) dr
+                        s1r.append(
+                            cp.asarray(-mol.intor('int1e_irp', shls_slice=shlslc).
+                                       reshape(3, 3, -1, mol.nao)))
                     if self.base.mm_mol.multipole_order > 1:
                         # s1rr[a,b,x,u,v] =
                         # \int phi_u [3/2*(r_a-Ri_a)(r_b-Ri_b)-1/2*(r-Ri)^2 delta_ab] (-\nable_x phi_v) dr
@@ -941,36 +942,214 @@ class QMMMGrad:
                             s1rr_[k,k] -= 0.5 * s1rr_trace
                         s1rr.append(s1rr_)
 
-        for jatm in range(mol.natm):
-            p0, p1 = aoslices[jatm, 2:]
+            for jatm in range(mol.natm):
+                p0, p1 = aoslices[jatm, 2:]
 
-            # d E_qm_pc / d Ri with fixed ewald_pot
-            qm_multipole_grad[jatm] += \
-                contract('uv,xuv->x', dEds[p0:p1], s1[:,p0:p1]) \
-              - contract('uv,xuv->x', dEds[:,p0:p1], s1[:,:,p0:p1])
+                # d E_qm_pc / d Ri with fixed ewald_pot
+                qm_multipole_grad[jatm] += \
+                    contract('uv,xuv->x', dEds[p0:p1], s1[:,p0:p1]) \
+                  - contract('uv,xuv->x', dEds[:,p0:p1], s1[:,:,p0:p1])
+
+                if self.base.mm_mol.multipole_order > 0:
+                    # d E_qm_dip / d Ri
+                    qm_multipole_grad[jatm] -= \
+                         contract('auv,axuv->x', dEdsr[:,p0:p1], s1r[jatm])
+                    s1r_ = list()
+                    for iatm in range(mol.natm):
+                        s1r_.append(s1r[iatm][...,p0:p1])
+                    s1r_ = cp.concatenate(s1r_, axis=-2)
+                    qm_multipole_grad[jatm] += contract('auv,axuv->x', dEdsr[...,p0:p1], s1r_)
+
+                if self.base.mm_mol.multipole_order > 1:
+                    # d E_qm_quad / d Ri
+                    qm_multipole_grad[jatm] -= \
+                            contract('abuv,abxuv->x', dEdsrr[:,:,p0:p1], s1rr[jatm])
+                    s1rr_ = list()
+                    for iatm in range(mol.natm):
+                        s1rr_.append(s1rr[iatm][...,p0:p1])
+                    s1rr_ = cp.concatenate(s1rr_, axis=-2)
+                    qm_multipole_grad[jatm] += contract('abuv,abxuv->x', dEdsrr[...,p0:p1], s1rr_)
+
+            s1 = s1r = s1rr = dEds = dEdsr = dEdsrr = None
+        else:
+            if 'lowdin' not in self.base.pop_method.lower():
+                raise NotImplementedError(f'Gradients for {self.base.pop_method} population analysis '
+                                          +'are not available.')
+            c_orth, c_orth_grad = orth.orth_ao_grad(mol, method=self.base.pop_method,
+                                                    pre_orth_ao=self.base.pre_orth_ao)
+            c_orth = cp.asarray(c_orth)
+            c_orth_grad = cp.asarray(c_orth_grad)
+            s = cp.asarray(self.base.get_ovlp())
+            c_inv = c_orth.conj().T.dot(s)
+            c_inv_H = s.dot(c_orth)
+            # dm in orth ao basis
+            dm_orth = reduce(cp.dot, (c_inv, dm, c_inv_H))
 
             if self.base.mm_mol.multipole_order > 0:
-                # d E_qm_dip / d Ri
-                qm_multipole_grad[jatm] -= \
-                     contract('auv,axuv->x', dEdsr[:,p0:p1], s1r[jatm])
-                s1r_ = list()
-                for iatm in range(mol.natm):
-                    s1r_.append(s1r[iatm][...,p0:p1])
-                s1r_ = cp.concatenate(s1r_, axis=-2)
-                qm_multipole_grad[jatm] += contract('auv,axuv->x', dEdsr[...,p0:p1], s1r_)
-
+                rdEdsr = cp.zeros((mol.nao, mol.nao))
             if self.base.mm_mol.multipole_order > 1:
-                # d E_qm_quad / d Ri
-                qm_multipole_grad[jatm] -= \
-                        contract('abuv,abxuv->x', dEdsrr[:,:,p0:p1], s1rr[jatm])
-                s1rr_ = list()
-                for iatm in range(mol.natm):
-                    s1rr_.append(s1rr[iatm][...,p0:p1])
-                s1rr_ = cp.concatenate(s1rr_, axis=-2)
-                qm_multipole_grad[jatm] += contract('abuv,abxuv->x', dEdsrr[...,p0:p1], s1rr_)
+                rdEdsrr = cp.zeros((3, mol.nao, mol.nao))
+                rrdEdsrr = cp.zeros((mol.nao, mol.nao))
+            # dEds* in orth AO basis
+            for iatm in range(mol.natm):
+                p0, p1 = aoslices[iatm, 2:]
+                v0 = cp.asarray(ewald_pot[0][iatm])
+                dEds[p0:p1] -= v0 * dm_orth[p0:p1]
+                if self.base.mm_mol.multipole_order > 0:
+                    v1 = cp.asarray(ewald_pot[1][iatm])
+                    dEdsr[:,p0:p1] -= contract('x,uv->xuv', v1, dm_orth[p0:p1])
+                    rdEdsr[p0:p1] += cp.dot(qm_coords[iatm], v1) * dm_orth[p0:p1]
+                if self.base.mm_mol.multipole_order > 1:
+                    v2 = cp.asarray(ewald_pot[2][iatm])
+                    dEdsrr[:,:,p0:p1] -= contract('xy,uv->xyuv', v2, dm_orth[p0:p1])
+                    vr = -contract('xy,y->x', v2, qm_coords[iatm])
+                    v2_trace = cp.einsum('xx->', v2)
+                    rdEdsrr[:,p0:p1] += -3 * contract('x,uv->xuv', vr, dm_orth[p0:p1]) \
+                                        - v2_trace * contract('x,uv->xuv', qm_coords[iatm], dm_orth[p0:p1])
+                    rvr = cp.dot(qm_coords[iatm], vr)
+                    r_norm2 = cp.dot(qm_coords[iatm], qm_coords[iatm])
+                    rrdEdsrr[p0:p1] += (3/2 * rvr + 0.5 * r_norm2 * v2_trace) * dm_orth[p0:p1]
+
+            # in principle for orth ao this s is eye
+            s_orth = reduce(cp.dot, (c_orth.conj().T, s, c_orth))
+
+            # full dimensional original AO matrices with (0,0,0) as origin
+            with mol.with_common_orig((0.0, 0.0, 0.0)):
+                if self.base.mm_mol.multipole_order > 0:
+                    r_ao = cp.asarray(mol.intor('int1e_r'))
+                    s1r_ao = cp.asarray(-mol.intor('int1e_irp')).reshape(3,3,mol.nao,mol.nao)
+                if self.base.mm_mol.multipole_order > 1:
+                    rr_ao = cp.asarray(mol.intor('int1e_rr'))
+                    s1rr_ao = cp.asarray(-mol.intor('int1e_irrp')).reshape(3,3,3,mol.nao,mol.nao)
+
+            s1c = contract('xuv,vq->xuq', s1, c_orth)
+            cs1 = contract('up,xuv->xpv', c_orth.conj(), s1)
+            if self.base.mm_mol.multipole_order > 0:
+                s1rc = contract('axuv,vq->axuq', s1r_ao, c_orth)
+                cs1r = contract('up,axuv->axpv', c_orth.conj(), s1r_ao)
+                sc = contract('uv,vq->uq', s, c_orth)
+            if self.base.mm_mol.multipole_order > 1:
+                s1rrc = contract('abxuv,vq->abxuq', s1rr_ao, c_orth)
+                cs1rr = contract('up,abxuv->abxpv', c_orth.conj(), s1rr_ao)
+                rc = contract('xuv,vq->xuq', r_ao, c_orth)
+                r_orth0 = contract('up,xuq->xpq', c_orth.conj(), rc)
+
+            for iatm in range(mol.natm):
+                p0, p1 = aoslices[iatm, 2:]
+                s1_ = contract('up,xuq->xpq', c_orth.conj()[p0:p1], s1c[:,p0:p1]) \
+                      - contract('xpv,vq->xpq', cs1[...,p0:p1], c_orth[p0:p1])
+                qm_multipole_grad[iatm] += contract('pq,xqp->x', dEds, s1_)
+
+                if self.base.mm_mol.multipole_order > 0:
+                    # 0-origin part
+                    s1r = - contract('up,axuq->axpq', c_orth.conj()[p0:p1], s1rc[:,:,p0:p1]) \
+                          + contract('axpv,vq->axpq', cs1r[...,p0:p1], c_orth[p0:p1])
+                    csc = contract('up,uq->pq', c_orth.conj()[p0:p1], sc[p0:p1])
+                    for k in range(3):
+                        s1r[k,k] += csc
+                    qm_multipole_grad[iatm] += contract('apq,axqp->x', dEdsr, s1r)
+                    # extra terms
+                    qm_multipole_grad[iatm] += contract('pq,xqp->x', rdEdsr, s1_)
+                    v1 = cp.asarray(ewald_pot[1][iatm])
+                    ps = contract('pq,qp->', dm_orth[p0:p1], s_orth[:,p0:p1])
+                    qm_multipole_grad[iatm] += v1 * ps
+
+                if self.base.mm_mol.multipole_order > 1:
+                    # 0-origin part
+                    s1rr = - contract('up,abxuq->abxpq', c_orth.conj()[p0:p1], s1rrc[:,:,:,p0:p1]) \
+                           + contract('abxpv,vq->abxpq', cs1rr[...,p0:p1], c_orth[p0:p1])
+                    crc = contract('up,xuq->xpq', c_orth.conj()[p0:p1], rc[:,p0:p1])
+                    for k in range(3):
+                        s1rr[k,:,k] += crc
+                        s1rr[:,k,k] += crc
+                    # traceless
+                    s1rr_trace = cp.einsum('aaxuv->xuv', s1rr)
+                    s1rr *= 3 / 2
+                    for k in range(3):
+                        s1rr[k,k] -= 0.5 * s1rr_trace
+                    qm_multipole_grad[iatm] += contract('abpq,abxqp->x', dEdsrr, s1rr)
+                    # extra terms
+                    qm_multipole_grad[iatm] += contract('apq,axqp->x', rdEdsrr, s1r) \
+                                               + contract('pq,xqp->x', rrdEdsrr, s1_)
+                    v2 = cp.asarray(ewald_pot[2][iatm])
+                    pr = contract('pq,xqp->x', dm_orth[p0:p1], r_orth0[...,p0:p1])
+                    v2_trace = cp.einsum('xx->', v2)
+                    qm_multipole_grad[iatm] += 3 * contract('xa,a->x', v2, pr) \
+                                               - v2_trace * pr \
+                                               - 3 * ps * contract('xy,y->x', v2, qm_coords[iatm]) \
+                                               + v2_trace * ps * qm_coords[iatm]
+
+            s1 = s1r = s1rr = s1rr_trace = s1r_ao = s1rr_ao = None
+            s1c = cs1 = s1rc = cs1r = sc = s1rrc = cs1rr = rc = r_orth0 = None
+            s1_ = csc = ps = crc = pr = rdEdsr = rdEdsrr = rrdEdsrr = None
+
+            self.base.c_orth = c_orth
+            if self.base.mm_mol.multipole_order > 0:
+                # rebuild, just in case there is a phase difference in c_orth
+                self.base.s1r = None
+                r_orth = self.base.get_s1r()
+            if self.base.mm_mol.multipole_order > 1:
+                self.base.s1rr = None
+                rr_orth = self.base.get_s1rr()
+            # C_orth derivative part:
+            # d (C^-1 P O C) = d(C^-1) P (C^-1)^+ C^+ O C + C^-1 P (C^-1)^+ C^+ O dC
+            # I = (C^-1)^+ C^+ is inserted to aid the evaluation
+            for iatm in range(mol.natm):
+                for x in range(3):
+                    # d c^-1 = - c^-1 dc c^-1
+                    dc = c_orth_grad[iatm, x]
+                    ddm = - reduce(cp.dot, (c_inv, dc, dm_orth))
+
+                    ds = reduce(cp.dot, (c_orth.conj().T, s, dc))
+                    if self.base.mm_mol.multipole_order > 0:
+                        temp = contract('xuv,vq->xuq', r_ao, dc)
+                        dr = contract('up,xuq->xpq', c_orth.conj(), temp)
+                    if self.base.mm_mol.multipole_order > 1:
+                        temp = contract('xuv,vq->xuq', rr_ao, dc)
+                        drr = contract('up,xuq->xpq', c_orth.conj(), temp)
+
+                    grad = 0.0
+                    for jatm in range(mol.natm):
+                        p0, p1 = aoslices[jatm, 2:]
+                        # dm derivative contribution
+                        v0 = cp.asarray(ewald_pot[0][jatm])
+                        grad -= v0 * contract('uv,vu->', ddm[p0:p1], s_orth[:,p0:p1])
+                        if self.base.mm_mol.multipole_order > 0:
+                            v1 = cp.asarray(ewald_pot[1][jatm])
+                            temp = contract('uv,xvu->x', ddm[p0:p1], r_orth[jatm])
+                            grad -= cp.dot(v1, temp)
+                        if self.base.mm_mol.multipole_order > 1:
+                            v2 = cp.asarray(ewald_pot[2][jatm])
+                            temp = contract('uv,xyvu->xy', ddm[p0:p1], rr_orth[jatm])
+                            grad -= contract('xy,xy->', v2, temp)
+
+                        # operator derivative contribution
+                        grad += contract('uv,vu->', dEds[p0:p1], ds[:,p0:p1])
+                        if self.base.mm_mol.multipole_order > 0:
+                            coord = qm_coords[jatm]
+                            ds1r = dr[:,:,p0:p1].copy()
+                            ds1r -= coord[:, None, None] * ds[None, :, p0:p1]
+                            grad += contract('xuv,xvu->', dEdsr[:,p0:p1], ds1r)
+                        if self.base.mm_mol.multipole_order > 1:
+                            ds1rr = drr[:,:,p0:p1].copy().reshape(3,3,mol.nao,-1)
+                            dr_ = dr[:,:,p0:p1]
+                            ds1rr -= coord[:, None, None, None] * dr_[None, :, :, :]
+                            ds1rr -= coord[None, :, None, None] * dr_[:, None,  :, :]
+                            ds1rr += coord[:, None, None, None] * coord[None, :, None, None] \
+                                     * ds[None, None, :, p0:p1]
+                            ds1rr_trace = cp.einsum('xxuv->uv', ds1rr)
+                            ds1rr *= 3/2
+                            for k in range(3):
+                                ds1rr[k,k] -= 0.5 * ds1rr_trace
+                            grad += contract('xyuv,xyvu->', dEdsrr[:,:,p0:p1], ds1rr)
+
+                    qm_multipole_grad[iatm, x] += grad.real
+
+            dm_orth = ddm = ds = dr = drr = ds1r = ds1rr = ds1rr_trace = None
+            s_orth = r_ao = rr_ao = dEds = dEdsr = dEdsrr = temp = None
+            s = c_inv = c_inv_H = c_orth_grad = None
 
         cput1 = logger.timer(self, 'grad_ewald pulay', *cput0)
-        s1 = s1r = s1rr = dEds = dEdsr = dEdsrr = None
 
         ew_eta, ew_cut = cell.get_ewald_params()
 
