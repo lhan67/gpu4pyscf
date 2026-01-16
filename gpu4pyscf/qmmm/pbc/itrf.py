@@ -1003,8 +1003,8 @@ class QMMMGrad:
                     dEdsrr[:,:,p0:p1] -= contract('xy,uv->xyuv', v2, dm_orth[p0:p1])
                     vr = -contract('xy,y->x', v2, qm_coords[iatm])
                     v2_trace = cp.einsum('xx->', v2)
-                    rdEdsrr[:,p0:p1] += -3 * contract('x,uv->xuv', vr, dm_orth[p0:p1]) \
-                                        - v2_trace * contract('x,uv->xuv', qm_coords[iatm], dm_orth[p0:p1])
+                    rdEdsrr[:,p0:p1] -= contract('x,uv->xuv', 3 * vr
+                                                 + v2_trace * qm_coords[iatm], dm_orth[p0:p1])
                     rvr = cp.dot(qm_coords[iatm], vr)
                     r_norm2 = cp.dot(qm_coords[iatm], qm_coords[iatm])
                     rrdEdsrr[p0:p1] += (3/2 * rvr + 0.5 * r_norm2 * v2_trace) * dm_orth[p0:p1]
@@ -1075,7 +1075,7 @@ class QMMMGrad:
                     v2_trace = cp.einsum('xx->', v2)
                     qm_multipole_grad[iatm] += 3 * contract('xa,a->x', v2, pr) \
                                                - v2_trace * pr \
-                                               - 3 * ps * contract('xy,y->x', v2, qm_coords[iatm]) \
+                                               - 3 * ps * contract('xa,a->x', v2, qm_coords[iatm]) \
                                                + v2_trace * ps * qm_coords[iatm]
 
             s1 = s1r = s1rr = s1rr_trace = s1r_ao = s1rr_ao = None
