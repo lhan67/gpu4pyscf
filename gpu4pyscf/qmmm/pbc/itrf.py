@@ -978,7 +978,6 @@ class QMMMGrad:
             c_orth, c_orth_grad = orth.orth_ao_grad(mol, method=self.base.pop_method,
                                                     pre_orth_ao=self.base.pre_orth_ao)
             c_orth = cp.asarray(c_orth)
-            c_orth_grad = cp.asarray(c_orth_grad)
             s = cp.asarray(self.base.get_ovlp())
             c_inv = c_orth.conj().T.dot(s)
             c_inv_H = s.dot(c_orth)
@@ -1095,9 +1094,10 @@ class QMMMGrad:
             # d (C^-1 P O C) = d(C^-1) P (C^-1)^+ C^+ O C + C^-1 P (C^-1)^+ C^+ O dC
             # I = (C^-1)^+ C^+ is inserted to aid the evaluation
             for iatm in range(mol.natm):
+                dc_ = cp.asarray(c_orth_grad(iatm))
                 for x in range(3):
                     # d c^-1 = - c^-1 dc c^-1
-                    dc = c_orth_grad[iatm, x]
+                    dc = dc_[x]
                     ddm = - reduce(cp.dot, (c_inv, dc, dm_orth))
 
                     ds = reduce(cp.dot, (c_orth.conj().T, s, dc))
@@ -1147,7 +1147,7 @@ class QMMMGrad:
 
             dm_orth = ddm = ds = dr = drr = ds1r = ds1rr = ds1rr_trace = None
             s_orth = r_ao = rr_ao = dEds = dEdsr = dEdsrr = temp = None
-            s = c_inv = c_inv_H = c_orth_grad = None
+            s = c_inv = c_inv_H = dc_ = None
 
         cput1 = logger.timer(self, 'grad_ewald pulay', *cput0)
 
