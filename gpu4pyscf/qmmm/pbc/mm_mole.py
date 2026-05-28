@@ -383,9 +383,9 @@ class Cell(qmmm.mm_mole.Mole, pbc.gto.Cell):
                 # qm octu - mm pc
                 # - cos(G*R1) sin(G*R2) + sin(G*R1) cos(G*R2)
                 temp  =  contract('gxy,gz->gxyz', tempGsR3, Gv)
-                ewg3  = -contract('gxyz,ig', temp, cosGvR1)
+                ewg3  = -contract('gxyz,ig->ixyz', temp, cosGvR1)
                 temp  =  contract('gxy,gz->gxyz', tempGcR3, Gv)
-                ewg3 +=  contract('gxyz,ig', temp, sinGvR1)
+                ewg3 +=  contract('gxyz,ig->ixyz', temp, sinGvR1)
                 ewg3 /= 6
         else:
             # qm pc - qm pc
