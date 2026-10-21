@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 import cupy
 import numpy
@@ -21,6 +22,57 @@ def tearDownModule():
 
 
 class KnownValues(unittest.TestCase):
+    def test_direct_j_truncated_electronic_metric(self):
+        from pyscf import df as cpu_df
+        from gpu4pyscf.df import df as electronic_df, int3c2e_bdiv
+        from gpu4pyscf.neo import df
+
+        auxmol = cpu_df.addons.make_auxmol(mol.components['e'], 'weigend')
+        j3c = cupy.asarray(cpu_df.incore.aux_e2(mol.components['e'], auxmol))
+        metric = int3c2e_bdiv.int2c2e(auxmol)
+        w, v = cupy.linalg.eigh(metric)
+        # A raised cutoff gives discarded directions with measurable integrals.
+        cutoff = .1
+        keep = w > cutoff
+        factor = v[:,keep] / cupy.sqrt(w[keep])
+        cderi = cupy.einsum('ijp,pk->kij', j3c, factor)
+        dm = gpu_neo.HF(mol).get_init_guess()
+        raw_rho = cupy.einsum('ijp,ij->p', j3c, dm['e'])
+        rest = v[:,~keep]
+        self.assertGreater(float(abs(raw_rho.dot(rest).dot(rest.T)).max()), 1e-3)
+
+        for df_nn in (False, True):
+            with self.subTest(df_nn=df_nn):
+                mf = gpu_neo.HF(mol).density_fit(
+                    auxbasis='weigend', df_ne=True, df_nn=df_nn)
+                e_df = mf.components['e'].with_df
+                e_df.build()
+                rows, cols = divmod(cupy.asarray(e_df._cderi_idx[0]), e_df.nao)
+                blocks = cupy.array_split(cderi[:,rows,cols], len(e_df._cderi))
+                e_df._cderi = []
+                for device_id, block in enumerate(blocks):
+                    with cupy.cuda.Device(device_id):
+                        e_df._cderi.append(cupy.asarray(block))
+                e_df.naux = int(keep.sum())
+                ref = gpu_neo.HF(mol).density_fit(
+                    auxbasis='weigend', df_ne=True, df_nn=df_nn)
+                ref.with_df._elec_with_df = None
+                expected = df.get_j(ref.with_df, dm)
+                # Keep the global metric at its production cutoff.
+                mf.with_df._cd_j2c = ref.with_df._cd_j2c
+                with patch.object(electronic_df, 'LINEAR_DEP_THR', cutoff), \
+                     patch.object(df, 'cholesky', side_effect=RuntimeError):
+                    actual = df.get_j(mf.with_df, dm)
+                for t in dm:
+                    cupy.testing.assert_allclose(actual[t], expected[t], atol=1e-8, rtol=0)
+                self.assertEqual(mf.with_df._j2c_e_rest.shape[1], rest.shape[1])
+                weights = cupy.linspace(-.2, .8, auxmol.nao)
+                potential = df._get_j_e_cderi(mf.with_df, weights[None])[0]
+                residual = weights.dot(rest).dot(rest.T)
+                potential += cupy.einsum('ijp,p->ij', j3c, residual)
+                cupy.testing.assert_allclose(
+                    potential, cupy.einsum('ijp,p->ij', j3c, weights), atol=1e-8, rtol=0)
+
     def test_cderi_host_prefetch(self):
         mol = neo.M(atom='''O 99.8140 100.8350 101.2320
                             H 99.3292  99.9768 101.0630

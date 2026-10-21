@@ -52,6 +52,8 @@ class DF(df.DF):
         self.nao = {}
         self._charges = {}
         self._elec_with_df = None
+        self._j2c_e_factor = None
+        self._j2c_e_rest = None
         self._auxmol_atom_major = None
 
     __getstate__, __setstate__ = lib.generate_pickle_methods(
@@ -85,7 +87,37 @@ class DF(df.DF):
         nuc_keys = [t for t in mol.components if t.startswith('n')]
         if not build_cderi and self.df_ne_j_engine == 'direct':
             self.j_engine = {}
-            self.j_engine['e'] = df_j_engine_3c2e.Int3c2eOpt(mol.components['e'], auxmol).build()
+            auxmol_e_j = auxmol
+            e_df = self._elec_with_df
+            self._j2c_e_factor = None
+            self._j2c_e_rest = None
+            if (e_df is not None and e_df.auxbasis == self.auxbasis and
+                    (e_df._cderi is not None or getattr(self, '_build_e_cderi', False))):
+                if e_df._cderi is None:
+                    e_df.build()
+                # Copy df.df._decompose_j2c's factorization and eigenvalue cutoff.
+                # Store the reverse transform from CDERI to raw auxiliary space.
+                j2c_e = int3c2e_bdiv.int2c2e(e_df.auxmol)
+                try:
+                    self._j2c_e_factor = cholesky(j2c_e)
+                except RuntimeError:
+                    w, v = cp.linalg.eigh(j2c_e)
+                    idx = cp.where(w > df.LINEAR_DEP_THR)[0]
+                    self._j2c_e_factor = v[:,idx] * cp.sqrt(w[idx])
+                    # rest @ rest.T projects onto directions omitted from CDERI.
+                    self._j2c_e_rest = v[:,w <= df.LINEAR_DEP_THR]
+                if sum(len(block) for block in e_df._cderi) != self._j2c_e_factor.shape[1]:
+                    raise ValueError('Electronic CDERI rank differs from its auxiliary metric')
+                # The remaining electronic-AO J work uses nuclear auxiliaries.
+                auxmol_e_j = auxmol.copy()
+                if self._j2c_e_rest is None or self._j2c_e_rest.shape[1] == 0:
+                    self._j2c_e_rest = None
+                    auxmol_e_j._bas = auxmol._bas[e_df.auxmol.nbas:].copy()
+                else:
+                    # CDERI omits these electronic metric directions. Evaluate
+                    # their raw source and potential directly for global J.
+                    auxmol_e_j = auxmol
+            self.j_engine['e'] = df_j_engine_3c2e.Int3c2eOpt(mol.components['e'], auxmol_e_j).build()
             if nuc_keys:
                 nuc_mols = {t: mol.components[t] for t in nuc_keys}
                 self.j_engine['n'] = j_engine_3c2e.Int3c2eOpt(nuc_mols, auxmol).build()
@@ -317,6 +349,8 @@ class DF(df.DF):
         self.j_engine = {}
         self._cderi_idx = {}
         self._cd_j2c = None
+        self._j2c_e_factor = None
+        self._j2c_e_rest = None
         self._auxmol_atom_major = None
         return self
 
@@ -712,6 +746,75 @@ def _get_rhoj(rhoj_e, rhoj_n, charges, components, df_nn):
     return rhoj
 
 
+def _get_rhoj_e_cderi(dfobj, dm, hermi):
+    # Follow df.df_jk.get_jk's packed-DM contractions and device-local DF.loop.
+    # The reverse metric transform R restores the source as R(B D).
+    e_df = dfobj._elec_with_df
+    reverse = dfobj._j2c_e_factor
+    pair_addresses, diags = e_df._cderi_idx
+    rows, cols = divmod(cp.asarray(pair_addresses), e_df.nao)
+    dms = cp.asarray(dm).reshape(-1, e_df.nao, e_df.nao)
+    dm_sparse = dms[:,rows,cols]
+    if hermi == 0:
+        dm_sparse += dms[:,cols,rows]
+    else:
+        dm_sparse *= 2
+    dm_sparse[:,diags] *= .5
+
+    def proc():
+        device_id = cp.cuda.Device().id
+        # Restore each actual device slice with the matching columns of R.
+        aux0 = sum(len(block) for block in e_df._cderi[:device_id])
+        naux = len(e_df._cderi[device_id])
+        density = asarray(dm_sparse)
+        rho = cp.empty((len(density), naux))
+        p0 = 0
+        if isinstance(e_df._cderi[device_id], np.ndarray):
+            # Complete prior buffer accesses before electronic DF.loop starts
+            # its first host-to-device copy on the independent I/O stream.
+            cp.cuda.get_current_stream().synchronize()
+        for _, cderi in e_df.loop(unpack=False):
+            p1 = p0 + len(cderi)
+            contract('np,Lp->nL', density, cderi, out=rho[:,p0:p1])
+            p0 = p1
+        return rho.dot(asarray(reverse[:,aux0:aux0+naux]).T)
+
+    results = multi_gpu.run(proc, non_blocking=True)
+    return multi_gpu.array_reduce(results, inplace=True)
+
+
+def _get_j_e_cderi(dfobj, auxvec):
+    # Follow df.df_jk.get_jk's packed J return and multi-device reduction.
+    # Global fitted coefficients require B.T R.T c; rows store c R.
+    e_df = dfobj._elec_with_df
+    pair_addresses, diags = e_df._cderi_idx
+    rows, cols = divmod(cp.asarray(pair_addresses), e_df.nao)
+    auxvec = auxvec.dot(dfobj._j2c_e_factor)
+
+    def proc():
+        device_id = cp.cuda.Device().id
+        aux0 = sum(len(block) for block in e_df._cderi[:device_id])
+        naux = len(e_df._cderi[device_id])
+        weights = asarray(auxvec[:,aux0:aux0+naux])
+        vj = cp.zeros((len(weights), len(rows)))
+        p0 = 0
+        if isinstance(e_df._cderi[device_id], np.ndarray):
+            # Order the electronic iterator's first I/O copy after preceding
+            # global-J contractions that can still access recycled buffers.
+            cp.cuda.get_current_stream().synchronize()
+        for _, cderi in e_df.loop(unpack=False):
+            p1 = p0 + len(cderi)
+            contract('nL,Lp->np', weights[:,p0:p1], cderi, beta=1, out=vj)
+            p0 = p1
+        return vj
+
+    results = multi_gpu.run(proc, non_blocking=True)
+    result = multi_gpu.array_reduce(results, inplace=True)
+    vj = cp.zeros((len(result), e_df.nao, e_df.nao))
+    vj[:,rows,cols] = vj[:,cols,rows] = result
+    return vj
+
+
 def get_j(dfobj, dm, hermi=1, output_components=None):
     from gpu4pyscf.df.int3c2e_bdiv import int2c2e
     if dfobj.df_ne_component_vint:
@@ -720,9 +823,14 @@ def get_j(dfobj, dm, hermi=1, output_components=None):
     if output_components is None:
         assert dm.keys() == dfobj.mol.components.keys()
     nuc_keys = [t for t in dfobj.mol.components if t.startswith('n')]
+    e_df = dfobj._elec_with_df
+    # Select sharing during engine setup; reset clears engines and factors.
+    build_e_cderi = (getattr(dfobj, '_build_e_cderi', False) and
+                     e_df is not None and e_df.auxbasis == dfobj.auxbasis and
+                     e_df._cderi is None)
     if (dfobj.auxmol is None or not dfobj.nao or
         'e' not in dfobj.j_engine or
-        (nuc_keys and 'n' not in dfobj.j_engine)):
+        (nuc_keys and 'n' not in dfobj.j_engine) or build_e_cderi):
         dfobj.build(build_cderi=False)
 
     if dfobj._cd_j2c is None:
@@ -768,6 +876,15 @@ def get_j(dfobj, dm, hermi=1, output_components=None):
     dm_e = intopt_e.mol.apply_C_mat_CT(dm_e)
     rhoj_e = intopt_e.contract_dm(dm_e, hermi)
     rhoj_e = intopt_e.auxmol.apply_CT_dot(rhoj_e, axis=-1)
+    if dfobj._j2c_e_factor is not None:
+        shared_rho = _get_rhoj_e_cderi(dfobj, dm['e'], hermi)
+        rhoj_e = rhoj_e.reshape(n_dm, -1)
+        if dfobj._j2c_e_rest is None:
+            rhoj_e = cp.hstack((shared_rho, rhoj_e))
+        else:
+            naux_e = dfobj._j2c_e_factor.shape[0]
+            rest = dfobj._j2c_e_rest
+            rhoj_e[:,:naux_e] = shared_rho + rhoj_e[:,:naux_e].dot(rest).dot(rest.T)
 
     intopt_n = dfobj.j_engine['n']
     rhoj_n = {}
@@ -803,9 +920,21 @@ def get_j(dfobj, dm, hermi=1, output_components=None):
 
     vj = {}
     if 'e' in output_components:
-        rhoj_t = intopt_e.auxmol.apply_C_dot(rhoj['e'], axis=-1)
+        rhoj_e = rhoj['e']
+        if dfobj._j2c_e_factor is not None:
+            naux_e = dfobj._j2c_e_factor.shape[0]
+            vj_e = _get_j_e_cderi(dfobj, rhoj_e[:,:naux_e])
+            if dfobj._j2c_e_rest is None:
+                rhoj_e = rhoj_e[:,naux_e:]
+            else:
+                rhoj_e = rhoj_e.copy()
+                rest = dfobj._j2c_e_rest
+                rhoj_e[:,:naux_e] = rhoj_e[:,:naux_e].dot(rest).dot(rest.T)
+        rhoj_t = intopt_e.auxmol.apply_C_dot(rhoj_e, axis=-1)
         vj['e'] = intopt_e.contract_auxvec(rhoj_t)
         vj['e'] = intopt_e.mol.apply_CT_mat_C(vj['e'])
+        if dfobj._j2c_e_factor is not None:
+            vj['e'] += vj_e
     if nuc_outputs:
         if dfobj.df_nn and nuc_source_keys:
             rhoj_n = cp.stack([rhoj[t] for t in nuc_keys])
@@ -864,8 +993,11 @@ def density_fit(mf, auxbasis=None, with_df=None, ee_only_dfj=False,
     maximum angular momentum and defaults to that of the nuclear AO basis.
 
     ``df_ne_j_engine='direct'`` uses the two-pass on-the-fly 3c DF-J builder
-    and is the default path.  ``df_ne_j_engine='cderi'`` uses stored CDERI
-    tensors and can build the electronic DF-K tensor as a Schur byproduct.
+    and is the default path. Electronic CDERI required for exchange supplies
+    its electronic auxiliary block; the remaining J integrals are evaluated
+    directly. Pure functionals do not build electronic CDERI for this reuse.
+    ``df_ne_j_engine='cderi'`` uses stored CDERI tensors and can build the
+    electronic DF-K tensor as a Schur byproduct.
 
     ``df_ne_component_vint`` controls an extra compatibility path for
     component-level calls such as ``mf.components['e'].get_fock()`` after a
@@ -1088,6 +1220,10 @@ class _DFNEO:
                          not self.ee_only_dfj and
                          (not isinstance(mf_e, scf.hf.KohnShamDFT) or
                           mf_e._numint.libxc.is_hybrid_xc(mf_e.xc)))
+        if build_e_cderi and isinstance(mf_e, scf.hf.KohnShamDFT):
+            omega = mf_e._numint.rsh_and_hybrid_coeff(mf_e.xc, spin=mf_e.mol.spin)[0]
+            if omega and getattr(mf_e, 'range_separated_mode', 'mix_outside_kernel') == 'mix_inside_kernel':
+                build_e_cderi = False
         with lib.temporary_env(self.with_df, _build_e_cderi=build_e_cderi):
             if self.with_df.df_ne_j_engine == 'direct':
                 return get_j(self.with_df, {'e': dm_e}, output_components=output_components)
@@ -1114,6 +1250,13 @@ class _DFNEO:
             raise NotImplementedError
 
         log = logger.new_logger(self)
+
+        build_e_cderi = not self.ee_only_dfj
+        if isinstance(mf_e, scf.hf.KohnShamDFT):
+            omega = mf_e._numint.rsh_and_hybrid_coeff(mf_e.xc, spin=mol_e.spin)[0]
+            build_e_cderi = build_e_cderi and mf_e._numint.libxc.is_hybrid_xc(mf_e.xc)
+            if omega and getattr(mf_e, 'range_separated_mode', 'mix_outside_kernel') == 'mix_inside_kernel':
+                build_e_cderi = False
 
         vhf = {}
         epc = {t: 0 for t in self.components}
@@ -1146,10 +1289,6 @@ class _DFNEO:
                         exc += epc['e'].exc
                     t0 = log.timer('epc', *t0)
 
-                build_e_cderi = (self.with_df.df_ne_j_engine == 'cderi' and
-                                 self.with_df.df_ne_scheme == 'global' and
-                                 not self.ee_only_dfj and
-                                 mf_e._numint.libxc.is_hybrid_xc(mf_e.xc))
                 _dm_tot = dm.copy()
                 _dm_tot['e'] = dm_e[0] + dm_e[1]
                 with lib.temporary_env(self.with_df, _build_e_cderi=build_e_cderi):
@@ -1210,10 +1349,6 @@ class _DFNEO:
                         exc += epc['e'].exc
                     t0 = log.timer('epc', *t0)
 
-                build_e_cderi = (self.with_df.df_ne_j_engine == 'cderi' and
-                                 self.with_df.df_ne_scheme == 'global' and
-                                 not self.ee_only_dfj and
-                                 mf_e._numint.libxc.is_hybrid_xc(mf_e.xc))
                 with lib.temporary_env(self.with_df, _build_e_cderi=build_e_cderi):
                     vj = self.get_j(mol, dm, hermi)
                 t0 = log.timer('global vj', *t0)
@@ -1253,9 +1388,6 @@ class _DFNEO:
             t0 = log.timer('veff (excluding vj)', *t0)
             vhf['e'] = tag_array(vxc, ecoul=ecoul, exc=exc)
         else:
-            build_e_cderi = (self.with_df.df_ne_j_engine == 'cderi' and
-                             self.with_df.df_ne_scheme == 'global' and
-                             not self.ee_only_dfj)
             if isinstance(mf_e, scf.uhf.UHF):
                 _dm_tot = dm.copy()
                 _dm_tot['e'] = dm['e'][0] + dm['e'][1]

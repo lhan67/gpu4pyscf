@@ -707,6 +707,37 @@ class Gradients(rhf_grad.GradientsBase):
     def symmetrize(self, de, atmlst=None):
         return rhf_grad_cpu.symmetrize(self.mol.components['e'], de, atmlst)
 
+    def grad_elec(self, mo_energy, mo_coeff, mo_occ, atmlst=None, *,
+                  electronic_grad=None, interaction_grad=None):
+        '''Assemble component and interaction derivatives from explicit inputs.'''
+        de = 0
+        grouped_components = {}
+        for t, comp in self.components.items():
+            if t == 'e' and electronic_grad is not None:
+                comp = electronic_grad
+            if self.grid_response is not None and hasattr(comp, 'grid_response'):
+                comp.grid_response = self.grid_response
+            if t.startswith('n'):
+                grouped_components[t] = comp
+            else:
+                de += comp.grad_elec(mo_energy=mo_energy[t],
+                                     mo_coeff=mo_coeff[t],
+                                     mo_occ=mo_occ[t])
+        if grouped_components:
+            dm0 = {}
+            dme0 = {}
+            for t, comp in grouped_components.items():
+                dm0[t] = comp.base.make_rdm1(mo_coeff[t], mo_occ[t])
+                dme0[t] = comp.make_rdm1e(mo_energy[t], mo_coeff[t], mo_occ[t])
+            de += _grouped_hcore_energy(grouped_components, dm0, dme0)
+            for comp in grouped_components.values():
+                de += cupy.asnumpy(comp.extra_force())
+
+        if interaction_grad is None:
+            interaction_grad = self.grad_int(mo_energy, mo_coeff, mo_occ)
+        de += interaction_grad
+        return de
+
     def kernel(self, mo_energy=None, mo_coeff=None, mo_occ=None, atmlst=None):
         cput0 = (logger.process_clock(), logger.perf_counter())
         if mo_energy is None:
@@ -728,28 +759,8 @@ class Gradients(rhf_grad.GradientsBase):
         if self.grid_response and hasattr(self.base, 'epc') and self.base.epc is not None:
             raise NotImplementedError('Grid response for NEO EPC gradients')
 
-        de = 0
-        grouped_components = {}
-        for t, comp in self.components.items():
-            if self.grid_response is not None and hasattr(comp, 'grid_response'):
-                comp.grid_response = self.grid_response
-            if t.startswith('n'):
-                grouped_components[t] = comp
-            else:
-                de += comp.grad_elec(mo_energy=mo_energy[t],
-                                     mo_coeff=mo_coeff[t],
-                                     mo_occ=mo_occ[t])
-        if grouped_components:
-            dm0 = {}
-            dme0 = {}
-            for t, comp in grouped_components.items():
-                dm0[t] = comp.base.make_rdm1(mo_coeff[t], mo_occ[t])
-                dme0[t] = comp.make_rdm1e(mo_energy[t], mo_coeff[t], mo_occ[t])
-            de += _grouped_hcore_energy(grouped_components, dm0, dme0)
-            for comp in grouped_components.values():
-                de += cupy.asnumpy(comp.extra_force())
+        de = self.grad_elec(mo_energy, mo_coeff, mo_occ, atmlst)
 
-        de += self.grad_int(mo_energy, mo_coeff, mo_occ)
         if hasattr(self.base, 'epc') and self.base.epc is not None:
             de += self.grad_epc(mo_energy, mo_coeff, mo_occ)
 
