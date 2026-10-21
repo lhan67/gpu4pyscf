@@ -262,6 +262,10 @@ class DF(df.DF):
             io_stream = cp.cuda.stream.Stream(non_blocking=True)
             io_event = cp.cuda.Event()
 
+            # Previous J contractions can still access recycled buffers.
+            # Order the initial I/O copy after those compute-stream accesses.
+            compute_event.record(comput_stream)
+            io_stream.wait_event(compute_event)
             for t in storage_keys:
                 if on_gpu[t]:
                     buf_prefetch[t] = cderi_sparse[t][:blksize]
@@ -722,7 +726,10 @@ def get_j(dfobj, dm, hermi=1, output_components=None):
         try:
             dfobj._cd_j2c = cholesky(j2c), 'cd'
         except RuntimeError:
-            dfobj._cd_j2c = j2c, None
+            # Follow df.df._decompose_j2c's retained auxiliary subspace.
+            w, v = cp.linalg.eigh(j2c)
+            idx = cp.where(w > df.LINEAR_DEP_THR)[0]
+            dfobj._cd_j2c = v[:,idx] / cp.sqrt(w[idx]), 'ed'
 
     if output_components is None:
         output_components = dfobj.mol.components
@@ -785,7 +792,7 @@ def get_j(dfobj, dm, hermi=1, output_components=None):
         rhoj = solve_triangular(j2c, rhoj.T, lower=True)
         rhoj = solve_triangular(j2c.T, rhoj, lower=False).T
     else:
-        rhoj = cp.linalg.solve(j2c, rhoj.T).T
+        rhoj = rhoj.dot(j2c).dot(j2c.T)
     n_rhs = n_dm
     rhoj = {t: rhoj[i*n_rhs:(i+1)*n_rhs] for i, t in enumerate(rhoj_keys)}
 

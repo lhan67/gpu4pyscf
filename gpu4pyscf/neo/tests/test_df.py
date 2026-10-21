@@ -21,6 +21,42 @@ def tearDownModule():
 
 
 class KnownValues(unittest.TestCase):
+    def test_cderi_host_prefetch(self):
+        mol = neo.M(atom='''O 99.8140 100.8350 101.2320
+                            H 99.3292  99.9768 101.0630
+                            H 99.1516 101.5610 101.4140
+                            O 98.8040  98.5122  97.7581
+                            H 99.7821  98.6469  97.9167
+                            H 98.4218  99.3265  97.3213''',
+                    basis='def2-svp', nuc_basis='pb4d', quantum_nuc=['H'], verbose=0)
+        for df_nn in (False, True):
+            with self.subTest(df_nn=df_nn):
+                mf = gpu_neo.CDFT(mol, xc='PBE0', epc=None).density_fit(
+                    auxbasis='def2-svp-jkfit', df_ne=True, df_nn=df_nn,
+                    df_ne_j_engine='cderi')
+                ref = gpu_neo.CDFT(mol, xc='PBE0', epc=None).density_fit(
+                    auxbasis='def2-svp-jkfit', df_ne=True, df_nn=df_nn,
+                    df_ne_j_engine='cderi')
+                mf.with_df.use_gpu_memory = False
+                mf.components['e'].with_df.use_gpu_memory = False
+                ref.with_df.use_gpu_memory = True
+                ref.components['e'].with_df.use_gpu_memory = True
+                dm = mf.get_init_guess()
+                expected = ref.get_j(dm=dm)
+                dm = {t: cupy.repeat(cupy.asarray(d)[None], 256, axis=0)
+                      for t, d in dm.items()}
+                mf.get_j(dm=dm)
+                for blocks in mf.with_df._cderi.values():
+                    self.assertIsInstance(blocks[0], numpy.ndarray)
+                cupy.cuda.get_current_stream().synchronize()
+                # Queue contractions so successive calls reuse live scratch buffers.
+                for trial in range(30):
+                    values = [mf.get_j(dm=dm) for i in range(7)]
+                    for t in dm:
+                        error = cupy.max(cupy.stack([
+                            cupy.max(abs(value[t]-expected[t])) for value in values]))
+                        self.assertLess(float(error), 2e-8)
+
     def test_scanner_spin(self):
         mol = neo.M(atom='H 0 0 0; Li 0 0 1.6', basis='sto-3g',
                     nuc_basis='pb4d', quantum_nuc=[0], verbose=0)
