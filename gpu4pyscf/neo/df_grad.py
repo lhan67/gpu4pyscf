@@ -7,6 +7,7 @@ from pyscf import lib
 from pyscf.df import addons
 
 from gpu4pyscf.df.grad import rhf as df_rhf_grad
+from gpu4pyscf.gto.mole import _split_l_ctr_groups
 from gpu4pyscf.df.int3c2e_bdiv import int2c2e, int2c2e_ip1_per_atom, int3c2e_scheme
 from gpu4pyscf.lib import logger
 from gpu4pyscf.lib.cupy_helper import contract
@@ -61,16 +62,15 @@ def _j_energy_per_atom(int3c2e_opt, dm, hermi=0, auxbasis_response=True,
     j2c = int2c2e(auxmol)
 
     # The common auxiliary metric is applied to all component source vectors.
-    rho = cp.vstack([auxmol.CT_dot_mat(rho[t]) for t in int3c2e_opt.component_names])
+    rho = auxmol.mat_dot_C(cp.vstack([rho[t] for t in int3c2e_opt.component_names]))
     if mol.omega <= 0 and not auxmol.mol.cart:
         rho = df_rhf_grad._gen_metric_solver(j2c, 'CD')(rho.T).T
     else:
         rho = df_rhf_grad._gen_metric_solver(j2c, 'ED')(rho.T).T
     j2c = None
-    rho = {t: rho[i] for i, t in enumerate(int3c2e_opt.component_names)}
-
     if auxbasis_response:
-        rho = {t: auxmol.C_dot_mat(rho[t]) for t in int3c2e_opt.component_names}
+        rho = auxmol.mat_dot_CT(rho)
+    rho = {t: rho[i] for i, t in enumerate(int3c2e_opt.component_names)}
     # Assemble the source seen by each distinguishable component. Nuclear
     # self-density is excluded; nuclear-nuclear sources are included with df_nn.
     rhoj = neo_df._get_rhoj(
@@ -84,7 +84,8 @@ def _j_energy_per_atom(int3c2e_opt, dm, hermi=0, auxbasis_response=True,
     if auxbasis_response:
         auxvec = rhoj
     else:
-        auxvec = {t: auxmol.C_dot_mat(rhoj[t]) for t in int3c2e_opt.component_names}
+        auxvec = auxmol.mat_dot_CT(cp.vstack([rhoj[t] for t in int3c2e_opt.component_names]))
+        auxvec = {t: auxvec[i] for i, t in enumerate(int3c2e_opt.component_names)}
 
     nsp_per_block, gout_stride, shm_size = int3c2e_scheme(
         short_range=mol.omega<0, gout_width=54, deriv=(1,0,0))
@@ -93,7 +94,10 @@ def _j_energy_per_atom(int3c2e_opt, dm, hermi=0, auxbasis_response=True,
     shm_size_max = shm_size[:laux+1,:lmax+1,:lmax+1].max()
     bas_ij_idx, shl_pair_offsets = int3c2e_bdiv._aggregate_shl_pair_blocks(
         mol, int3c2e_opt.bas_ij_blocks, nsp_per_block[0]*16)
-    ksh_offsets_cpu = np.append(0, np.cumsum(auxmol.l_ctr_counts))
+    # Match the derivative kernel's 16-shell auxiliary capacity.
+    _, aux_counts = _split_l_ctr_groups(
+        auxmol.uniq_l_ctr, auxmol.l_ctr_counts, [16]*(laux+1))
+    ksh_offsets_cpu = np.append(0, np.cumsum(aux_counts))
     ksh_offsets_gpu = cp.asarray(ksh_offsets_cpu+mol.nbas, dtype=np.int32)
 
     int3c2e_envs = int3c2e_opt.int3c2e_envs

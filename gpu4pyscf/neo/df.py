@@ -141,7 +141,7 @@ class DF(df.DF):
                       lr_factor=lr_factor, sr_factor=sr_factor)
 
     def get_blksize(self, extra=0, nao=None, mem_fraction=0.3,
-                    blksize_cap=None, unpack=True):
+                    blksize_cap=None, unpack=True, n_dm=1):
         '''
         extra for pre-calculated space for other variables
         '''
@@ -166,6 +166,9 @@ class DF(df.DF):
         if unpack:
             for t, nao_t in nao.items():
                 denom += nao_t * nao_t
+        else:
+            # Packed J needs five auxiliary work vectors per density set.
+            denom += 5*n_dm
         if not on_gpu['e']:
             denom += len(self._cderi_idx['e'][0]) * 2
         if nuc_keys and not on_gpu['n']:
@@ -177,7 +180,7 @@ class DF(df.DF):
             blksize = naux_slice
         else:
             blksize = word_avail // denom
-        if blksize > df.ALIGNED:
+        if df.ALIGNED < blksize < naux_slice:
             blksize = blksize // df.ALIGNED * df.ALIGNED
         if blksize_cap is not None:
             blksize = min(blksize, blksize_cap)
@@ -632,7 +635,8 @@ def get_jk(dfobj, dms, hermi=0, with_j=True, with_k=True,
         if group_n_output:
             vj_n = cp.zeros((n_dm, sum(len(rows[t]) for t in nuc_outputs)))
 
-        blksize = dfobj.get_blksize(mem_fraction=0.4, nao=dfobj.nao, unpack=False)
+        blksize = dfobj.get_blksize(mem_fraction=0.4, nao=dfobj.nao,
+                                    unpack=False, n_dm=n_dm)
         if nuc_source_keys:
             dm_n = cp.concatenate([_dm_sparse[t] * dfobj._charges[t]
                                    for t in nuc_source_keys], axis=1)
@@ -724,9 +728,13 @@ def get_j(dfobj, dm, hermi=1, output_components=None):
     if dfobj._cd_j2c is None:
         j2c = int2c2e(dfobj.auxmol)
         try:
-            dfobj._cd_j2c = cholesky(j2c), 'cd'
+            # Follow df.df._decompose_j2c: cache A=L^-T for repeated GEMM.
+            cd_low = cholesky(j2c)
+            aux_coeff = solve_triangular(
+                cd_low, cp.eye(j2c.shape[0]), lower=True, overwrite_b=True).T
+            dfobj._cd_j2c = aux_coeff, 'cd'
         except RuntimeError:
-            # Follow df.df._decompose_j2c's retained auxiliary subspace.
+            # Match df.df._decompose_j2c's retained auxiliary subspace.
             w, v = cp.linalg.eigh(j2c)
             idx = cp.where(w > df.LINEAR_DEP_THR)[0]
             dfobj._cd_j2c = v[:,idx] / cp.sqrt(w[idx]), 'ed'
@@ -767,11 +775,12 @@ def get_j(dfobj, dm, hermi=1, output_components=None):
         dm_nuc = {t: intopt_n.component_opts[t].mol.apply_C_mat_CT(dm[t])
                   for t in nuc_source_keys}
         rhoj_n = intopt_n.contract_dm(dm_nuc, hermi)
-        for t in nuc_source_keys:
-            rhoj_n[t] = intopt_n.auxmol.apply_CT_dot(rhoj_n[t], axis=-1)
+        rhoj_n = cp.stack([rhoj_n[t] for t in nuc_source_keys])
+        rhoj_n = intopt_n.auxmol.apply_CT_dot(rhoj_n, axis=-1)
+        rhoj_n = dict(zip(nuc_source_keys, rhoj_n))
     rhoj_component = _get_rhoj(rhoj_e, rhoj_n, dfobj._charges, dfobj.mol.components, dfobj.df_nn)
 
-    j2c, tag = dfobj._cd_j2c
+    j2c = dfobj._cd_j2c[0]
     naux = rhoj_e.shape[-1]
     rhoj = []
     rhoj_keys = []
@@ -788,11 +797,7 @@ def get_j(dfobj, dm, hermi=1, output_components=None):
             rhoj.append(rhoj_component[nuc_outputs[0]].reshape(-1, naux))
             rhoj_keys.append('n')
     rhoj = rhoj[0] if len(rhoj) == 1 else cupy.vstack(rhoj)
-    if tag == 'cd':
-        rhoj = solve_triangular(j2c, rhoj.T, lower=True)
-        rhoj = solve_triangular(j2c.T, rhoj, lower=False).T
-    else:
-        rhoj = rhoj.dot(j2c).dot(j2c.T)
+    rhoj = rhoj.dot(j2c).dot(j2c.T)
     n_rhs = n_dm
     rhoj = {t: rhoj[i*n_rhs:(i+1)*n_rhs] for i, t in enumerate(rhoj_keys)}
 
@@ -803,8 +808,9 @@ def get_j(dfobj, dm, hermi=1, output_components=None):
         vj['e'] = intopt_e.mol.apply_CT_mat_C(vj['e'])
     if nuc_outputs:
         if dfobj.df_nn and nuc_source_keys:
-            rhoj_n = {t: intopt_n.auxmol.apply_C_dot(rhoj[t], axis=-1) for t in nuc_keys}
-            vj_n = intopt_n.contract_auxvec(rhoj_n, componentwise=True)
+            rhoj_n = cp.stack([rhoj[t] for t in nuc_keys])
+            rhoj_n = intopt_n.auxmol.apply_C_dot(rhoj_n, axis=-1)
+            vj_n = intopt_n.contract_auxvec(dict(zip(nuc_keys, rhoj_n)), componentwise=True)
         else:
             rhoj_n = rhoj[nuc_outputs[0]] if dfobj.df_nn else rhoj['n']
             rhoj_n = intopt_n.auxmol.apply_C_dot(rhoj_n, axis=-1)

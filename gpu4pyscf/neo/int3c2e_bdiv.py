@@ -10,7 +10,8 @@ from pyscf import gto
 from pyscf.gto.mole import ANG_OF, ATOM_OF, PTR_EXP, conc_env
 from gpu4pyscf.df import int3c2e_bdiv
 from gpu4pyscf.gto.mole import (
-    PTR_BAS_COORD, SortedMole, RysIntEnvVars, extract_pgto_params)
+    PTR_BAS_COORD, SortedMole, RysIntEnvVars, extract_pgto_params,
+    _split_l_ctr_groups)
 from gpu4pyscf.lib import logger
 from gpu4pyscf.lib.cupy_helper import asarray, ndarray, transpose_sum
 from gpu4pyscf.lib.utils import splits_by_blocksize
@@ -318,20 +319,14 @@ class Int3c2eOpt(int3c2e_bdiv.Int3c2eOpt):
         component_mols = {
             t: SortedMole.from_cell(self.components[t])
             for t in self.component_names}
-        # shell_local[ish] is the original component-local shell number for
-        # sorted combined shell ish. local_ao_loc[ish] then gives the first AO
-        # of that shell in component_mols[t].
+        # SortedMole stably sorts both the combined basis and each component
+        # by (l, -nprim). Selecting one component from the combined shell order
+        # therefore gives exactly that component's independently sorted order.
         shell_component = self.atom_component[mol._bas[:,ATOM_OF]]
-        shell_local = np.concatenate(
-            [np.arange(component_mols[t].nbas) for t in self.component_names]
-        )[mol.sorted_idx]
         local_ao_loc = np.empty(mol.nbas, dtype=np.int32)
         for ic, t in enumerate(self.component_names):
-            mol_t = component_mols[t]
-            inv_sorted = np.empty_like(mol_t.sorted_idx)
-            inv_sorted[mol_t.sorted_idx] = np.arange(mol_t.nbas)
             idx = np.where(shell_component == ic)[0]
-            local_ao_loc[idx] = mol_t.ao_loc[inv_sorted[shell_local[idx]]]
+            local_ao_loc[idx] = component_mols[t].ao_loc[:-1]
 
         return component_mols, local_ao_loc
 
@@ -360,8 +355,11 @@ class Int3c2eOpt(int3c2e_bdiv.Int3c2eOpt):
             # ao_pair_loc[p] is the first flattened AO-pair row generated for
             # bas_ij_idx[p], so its final value is sum_t npair_t.
             bas_ij_blocks = self.bas_ij_blocks
+            # Follow df.int3c2e_bdiv.Int3c2eOpt.int3c2e_evaluator's limits.
+            pair_batch_size = np.minimum(nsp_per_block[0]*4,
+                                         np.maximum(nsp_per_block[0]//4, 16))
             bas_ij_idx, shl_pair_offsets = _aggregate_shl_pair_blocks(
-                mol, bas_ij_blocks, nsp_per_block[0]*4)
+                mol, bas_ij_blocks, pair_batch_size)
             ao_pair_loc = _get_ao_pair_loc_blocks(mol.uniq_l_ctr[:,0], bas_ij_blocks, cart)
             nao_pair = ao_pair_loc[-1].get()
 
@@ -395,13 +393,16 @@ class Int3c2eOpt(int3c2e_bdiv.Int3c2eOpt):
             uniq_l_ctr_aux = auxmol.uniq_l_ctr
             aux_loc = auxmol.ao_loc
             if aux_batch_size is None:
+                uniq_l_ctr_aux, aux_counts = _split_l_ctr_groups(
+                    auxmol.uniq_l_ctr, auxmol.l_ctr_counts, [16]*(laux+1))
+                l_ctr_aux_offsets = np.append(0, np.cumsum(aux_counts))
                 ksh_offsets_cpu = l_ctr_aux_offsets
                 aux_splits = [0, len(ksh_offsets_cpu)-1]
             else:
                 l_ctr_aux_offsets, uniq_l_ctr_aux = _split_l_ctr_pattern(
                     l_ctr_aux_offsets, uniq_l_ctr_aux, aux_batch_size)
                 ksh_offsets_cpu = l_ctr_aux_offsets
-                aux_splits = range(len(ksh_offsets_cpu))
+                aux_splits = splits_by_blocksize(aux_loc[ksh_offsets_cpu], aux_batch_size)
             aux_offsets = aux_loc[ksh_offsets_cpu[aux_splits]]
             if reorder_aux:
                 aux_sorting = argsort_aux(l_ctr_aux_offsets, uniq_l_ctr_aux)
