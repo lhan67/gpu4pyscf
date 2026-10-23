@@ -10,7 +10,7 @@ from gpu4pyscf import __config__
 from gpu4pyscf import scf as scf_gpu
 from gpu4pyscf import lib
 from gpu4pyscf.lib import logger, utils
-from gpu4pyscf.lib.cupy_helper import asarray, tag_array
+from gpu4pyscf.lib.cupy_helper import asarray, get_avail_mem, tag_array
 from gpu4pyscf.qmmm.itrf import _mm_charge_integrals
 
 
@@ -520,6 +520,17 @@ def get_fock(mf, h1e=None, s1e=None, vhf=None, dm=None, cycle=-1,
         raise NotImplementedError('Damping for multi-component SCF is not yet implemented.')
 
     if diis is not None and cycle >= diis_start_cycle:
+        if diis.incore is None:
+            # Follow scf.diis.CDIIS.update's history-memory estimate for the
+            # packed component Focks and type-4 Lagrange multipliers.
+            mem_avail = get_avail_mem()
+            vector_bytes = sum(f_t.nbytes for f_t in f.values())
+            if is_cdft and diis_type == 4:
+                vector_bytes += 3 * sum(t.startswith('n') for t in f) * mf.f.itemsize
+            diis.incore = vector_bytes*2 * (20+diis.space) < mem_avail
+            if not diis.incore:
+                logger.debug(mf, 'Large system detected. DIIS intermediates '
+                             'are saved in the host memory')
         if is_cdft:
             keys = sorted(f.keys())
             shapes = {k: f[k].shape for k in keys}
