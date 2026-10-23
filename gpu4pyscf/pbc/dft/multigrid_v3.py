@@ -50,7 +50,7 @@ from gpu4pyscf.__config__ import props as gpu_specs
 from gpu4pyscf.lib import multi_gpu
 from gpu4pyscf.dft import numint
 from gpu4pyscf.pbc import tools
-from gpu4pyscf.pbc.tools import k2gamma, get_coulG
+from gpu4pyscf.pbc.tools import k2gamma, get_coulG, ke_to_mesh, mesh_to_ke
 from gpu4pyscf.pbc.lib.kpts_helper import fft_matrix
 from gpu4pyscf.pbc.df.fft_jk import _format_dms, _format_jks
 from gpu4pyscf.pbc.df.aft import _get_ZSI
@@ -631,33 +631,6 @@ def _estimate_fft_Ecut_per_shell(cell, precision):
     Ecut = E2 * 2
     return Ecut
 
-def ke_to_mesh(a, cutoff):
-    '''
-    Based on pyscf.pbc.tools.pbc.cutoff_to_mesh
-    '''
-    b = 2 * np.pi * np.linalg.inv(a.T)
-    rx = np.linalg.qr(b[[1,2,0]].T)[1][2,2]
-    ry = np.linalg.qr(b[[2,0,1]].T)[1][2,2]
-    rz = np.linalg.qr(b.T)[1][2,2]
-
-    Gmax = (2*cutoff)**.5 / np.abs([rx, ry, rz])
-    mesh = np.ceil(Gmax * 2).astype(np.int32)
-    return mesh
-
-def mesh_to_ke(a, mesh):
-    '''
-    Based on pyscf.pbc.tools.pbc.mesh_to_cutoff
-    '''
-    b = 2 * np.pi * np.linalg.inv(a.T)
-    rx = np.linalg.qr(b[[1,2,0]].T)[1][2,2]
-    ry = np.linalg.qr(b[[2,0,1]].T)[1][2,2]
-    rz = np.linalg.qr(b.T)[1][2,2]
-
-    gs = np.asarray(mesh) / 2
-    Gmax = gs * np.array([rx, ry, rz])
-    ke_cutoff = Gmax**2 / 2
-    return ke_cutoff
-
 def _partition_ke_for_aft(ni, pair_idx, pair_ke, init_ke, ke_max, xctype, log):
     cell = ni.sorted_cell
     bvkcell = ni.bvkcell
@@ -675,7 +648,11 @@ def _partition_ke_for_aft(ni, pair_idx, pair_ke, init_ke, ke_max, xctype, log):
     while ke_upper > 0:
         if ke_lower < init_ke:
             ke_lower = 0 # To include all remaining diffuse orbital pairs
-        filtered_pairs = pair_idx[(ke_lower < pair_ke) & (pair_ke <= ke_upper)]
+        # Compare in pair_ke's dtype (float32): pairs clamped at a
+        # float32-rounded Ecut_max would otherwise fall out of every bucket.
+        lo = pair_ke.dtype.type(ke_lower)
+        hi = pair_ke.dtype.type(ke_upper)
+        filtered_pairs = pair_idx[(lo < pair_ke) & (pair_ke <= hi)]
         if len(filtered_pairs) > 0:
             ish, jsh = divmod(filtered_pairs, NBAS_MAX)
             lij = ang_by_shell[ish] * 6 + ang_by_shell[jsh]
@@ -2020,14 +1997,21 @@ class MultiGridNumInt(multigrid_v1.MultiGridNumIntBase):
 
     def __init__(self, cell):
         self.reset(cell)
-        self.mesh = cell.mesh
+        self._mesh = None
+
+    @property
+    def mesh(self):
+        # Follow the current cell unless a DF mesh was explicitly assigned.
+        if self._mesh is None:
+            return self.cell.mesh
+        return self._mesh
+    @mesh.setter
+    def mesh(self, value):
+        self._mesh = value
 
     def reset(self, cell=None):
         if cell is not None:
             self.cell = cell
-            # Preferable to preserve the mesh setting during geometry
-            # optimization
-            #self.mesh = cell.mesh
         self.bvkcell = None
         self.mg_envs = None
         self.aft_buckets = None

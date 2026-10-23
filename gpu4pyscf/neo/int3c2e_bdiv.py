@@ -193,12 +193,12 @@ def _get_ao_pair_loc_blocks(uniq_l, bas_ij_blocks, cart=True):
     return ao_pair_loc
 
 
-def _create_pair_recontraction(intopt, int3c2e_context):
+def _create_pair_recontractor(intopt, int3c2e_context):
     # pair_addresses initially index the square AO matrix of the concatenated
     # original molecule. cderi_idx[t] converts the addresses belonging to t
     # into flattened indices of the component-local (nao_t,nao_t) matrix.
     recontract, ao_pair_counts, contracted_ao_pair_counts, pair_addresses = \
-            int3c2e_bdiv._create_pair_recontraction(intopt.mol, int3c2e_context)
+            int3c2e_bdiv._create_pair_recontractor(intopt.mol, int3c2e_context)
 
     cderi_idx = {}
     nao = int(intopt.mol.mol.ao_loc[-1])

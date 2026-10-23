@@ -408,12 +408,12 @@ def _cholesky_eri_with_aux_coef(intopt, auxmol_e=None, aux_coef=None,
     if needs_recontraction:
         if isinstance(intopt, neo_int3c2e_bdiv.Int3c2eOpt):
             recontract, ao_pair_counts, contracted_ao_pair_counts, cderi_idx = \
-                    neo_int3c2e_bdiv._create_pair_recontraction(intopt, clone_context)
+                    neo_int3c2e_bdiv._create_pair_recontractor(intopt, clone_context)
             cderi_npairs = sum(len(pair_addresses)
                                for pair_addresses, diag_addrs in cderi_idx.values())
         else:
             recontract, ao_pair_counts, contracted_ao_pair_counts, pair_addresses = \
-                    int3c2e_bdiv._create_pair_recontraction(sorted_mol, clone_context)
+                    int3c2e_bdiv._create_pair_recontractor(sorted_mol, clone_context)
             cderi_npairs = len(pair_addresses)
             pair_addresses = asarray(pair_addresses)
             rows, cols = divmod(pair_addresses, mol.nao)
@@ -497,6 +497,7 @@ def _cholesky_eri_with_aux_coef(intopt, auxmol_e=None, aux_coef=None,
                 p0, p1 = cderi_offsets[batch_id:batch_id+2]
                 # TODO: async-write to host memory in another stream
                 err = libvhf_rys.transpose_write(
+                    ctypes.cast(cp.cuda.get_current_stream().ptr, ctypes.c_void_p),
                     cderi_cpu.ctypes,
                     ctypes.cast(cderi_gpu.data.ptr, ctypes.c_void_p),
                     ctypes.c_int(naux), ctypes.c_int(cderi_npairs),

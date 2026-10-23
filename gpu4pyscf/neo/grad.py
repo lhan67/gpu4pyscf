@@ -16,7 +16,7 @@ from gpu4pyscf.gto.ecp import get_ecp_ip
 from gpu4pyscf.gto.mole import SortedGTO, SortedMole
 from gpu4pyscf.gto.int3c1e_ip import int1e_grids_ip1, int1e_grids_ip2
 from gpu4pyscf.lib import logger, utils
-from gpu4pyscf.lib.cupy_helper import condense
+from gpu4pyscf.lib.cupy_helper import add_sparse, condense
 from gpu4pyscf.neo import ks
 from gpu4pyscf.qmmm.itrf import _mm_charge_integrals
 
@@ -599,9 +599,9 @@ def grad_epc(mf_grad, mo_energy=None, mo_coeff=None, mo_occ=None, atmlst=None):
             continue
 
         ao_n = numint.eval_ao(
-            sorted_mol_n, coords, deriv=1, nao_slice=len(idx_n),
-            shls_slice=non0shl_idx, ao_loc_slice=ao_loc_slice,
-            ctr_offsets_slice=ctr_offsets_slice, gdftopt=opt_n,
+            sorted_mol_n, coords, deriv=1,
+            screening_info=(len(idx_n), non0shl_idx, ao_loc_slice, ctr_offsets_slice),
+            gdftopt=opt_n,
             transpose=False)
         if pad > 0:
             ao_n[:,-pad:] = 0.0
@@ -626,11 +626,11 @@ def grad_epc(mf_grad, mo_energy=None, mo_coeff=None, mo_occ=None, atmlst=None):
 
             aow_n = numint._scale_ao(ao_n_t[0], weight * vxc_n_grid)
             vtmp = rks_grad._d1_dot_(ao_n_t[1:4], aow_n.T)
-            vxc_n[:,idx_n_t[:,None],idx_n_t] += vtmp
+            add_sparse(vxc_n, vtmp, idx_n_t)
 
         aow_e = numint._scale_ao(ao_e[0], weight * vxc_e_grid)
         vtmp = rks_grad._d1_dot_(ao_e[1:4], aow_e.T)
-        vxc_e[:,idx_e[:,None],idx_e] += vtmp
+        add_sparse(vxc_e, vtmp, idx_e)
 
     vxc_e = opt_e.unsort_orbitals(vxc_e, axis=[1,2])
     vxc_n = opt_n.unsort_orbitals(vxc_n, axis=[1,2])

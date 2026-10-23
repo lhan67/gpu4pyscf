@@ -125,9 +125,9 @@ def _get_epc_vmat_task(mf, grids, grids_n, sorted_mol_e, dm_e, opt_n, mol_n_all,
             pad, idx_n, non0shl_idx, ctr_offsets_slice, ao_loc_slice = non0ao_idx_n[block_id]
             if len(idx_n) > 0:
                 ao_n = numint.eval_ao(
-                    sorted_mol_n, coords, deriv=0, nao_slice=len(idx_n),
-                    shls_slice=non0shl_idx, ao_loc_slice=ao_loc_slice,
-                    ctr_offsets_slice=ctr_offsets_slice, gdftopt=opt_n,
+                    sorted_mol_n, coords, deriv=0,
+                    screening_info=(len(idx_n), non0shl_idx, ao_loc_slice, ctr_offsets_slice),
+                    gdftopt=opt_n,
                     transpose=False)
                 if pad > 0:
                     ao_n[-pad:,:] = 0.0
