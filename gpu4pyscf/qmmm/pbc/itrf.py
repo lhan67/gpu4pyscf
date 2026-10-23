@@ -97,8 +97,6 @@ def qmmm_for_scf(method, mm_mol):
         # Avoid to initialize QMMM twice
         if isinstance(method, QMMM):
             method.mm_mol = mm_mol
-            method.pop_method = 'mulliken'
-            method.pre_orth_ao = 'ANO'
             method.c_orth = None
             method.s1r = None
             method.s1rr = None
@@ -139,6 +137,17 @@ class QMMMSCF(QMMM):
         self.mm_ewald_pot = None
         self.qm_ewald_hess = None
         self.e_nuc = None
+
+    def reset(self, mol=None):
+        # Multipole integrals, orthogonalization and Ewald terms depend on geometry.
+        self.c_orth = None
+        self.s1r = None
+        self.s1rr = None
+        self.s1rrr = None
+        self.mm_ewald_pot = None
+        self.qm_ewald_hess = None
+        self.e_nuc = None
+        return super().reset(mol)
 
     def dump_flags(self, verbose=None):
         super().dump_flags(verbose)
@@ -187,7 +196,7 @@ class QMMMSCF(QMMM):
         if self.mm_mol.multipole_order > 2:
             ewpot0 += contract('ijxyz,jxyz->i', qm_ewald_hess[5], octus)
             ewpot1 += contract('ijxyz,jyz->ix', qm_ewald_hess[4], quads)
-            ewpot2 += contract('ijxyz,iz->ixy', qm_ewald_hess[4], dips)
+            ewpot2 -= contract('ijxyz,jz->ixy', qm_ewald_hess[4], dips)
             ewpot3  = contract('ijxyz,i->jxyz', qm_ewald_hess[5], charges)
         ewpot = list()
         ewpot.append(ewpot0)
@@ -213,7 +222,7 @@ class QMMMSCF(QMMM):
             if self.mm_mol.multipole_order > 2:
                 ewpot0_.append(contract('ijxyz,jxyz->i', qm_ewald_hess[5], octus))
                 ewpot1_.append(contract('ijxyz,jyz->ix', qm_ewald_hess[4], quads))
-                ewpot2_.append(contract('ijxyz,iz->ixy', qm_ewald_hess[4], dips))
+                ewpot2_.append(-contract('ijxyz,jz->ixy', qm_ewald_hess[4], dips))
                 ewpot3_ = list()
                 ewpot3_.append(contract('ijxyz,i->jxyz', qm_ewald_hess[5], charges))
             ene_decomp.append(ewpot0_)
@@ -492,6 +501,8 @@ class QMMMSCF(QMMM):
         return self.s1rrr
 
     def get_qm_octupoles(self, dm, s1rrr=None):
+        if dm.ndim == 3:
+            dm = dm[0] + dm[1]
         dm = cp.asarray(dm)
         if self.pop_method.lower() != 'mulliken':
             if self.c_orth is None:
@@ -547,25 +558,22 @@ class QMMMSCF(QMMM):
             s = cp.asarray(self.get_ovlp())
             c_inv = self.c_orth.conj().T.dot(s)
             c_inv_H = s.dot(self.c_orth)
+            # Sum the multipole operators in the orthogonal basis before
+            # applying their common transformation to the original AO basis.
             for iatm in range(mol.natm):
                 v0 = cp.asarray(ewald_pot[0][iatm])
                 p0, p1 = aoslices[iatm, 2:]
-                vdiff -= v0 * contract('pu,vp->uv', c_inv[p0:p1], c_inv_H[:,p0:p1])
+                vdiff[p0:p1,p0:p1] -= v0 * cp.eye(p1-p0)
                 if self.mm_mol.multipole_order > 0:
                     v1 = cp.asarray(ewald_pot[1][iatm])
-                    temp = contract('vq,xqp->xvp', c_inv_H, s1r[iatm])
-                    temp = contract('pu,xvp->xuv', c_inv[p0:p1], temp)
-                    vdiff -= contract('x,xuv->uv', v1, temp)
+                    vdiff[:,p0:p1] -= contract('x,xuv->uv', v1, s1r[iatm])
                 if self.mm_mol.multipole_order > 1:
                     v2 = cp.asarray(ewald_pot[2][iatm])
-                    temp = contract('vq,xyqp->xyvp', c_inv_H, s1rr[iatm])
-                    temp = contract('pu,xyvp->xyuv', c_inv[p0:p1], temp)
-                    vdiff -= contract('xy,xyuv->uv', v2, temp)
+                    vdiff[:,p0:p1] -= contract('xy,xyuv->uv', v2, s1rr[iatm])
                 if self.mm_mol.multipole_order > 2:
                     v3 = cp.asarray(ewald_pot[3][iatm])
-                    temp = contract('vq,xyzqp->xyzvp', c_inv_H, s1rrr[iatm])
-                    temp = contract('pu,xyzvp->xyzuv', c_inv[p0:p1], temp)
-                    vdiff -= contract('xyz,xyzuv->uv', v3, temp)
+                    vdiff[:,p0:p1] -= contract('xyz,xyzuv->uv', v3, s1rrr[iatm])
+            vdiff = reduce(cp.dot, (c_inv_H, vdiff, c_inv))
         vdiff = (vdiff + vdiff.T) / 2
         return vdiff
 

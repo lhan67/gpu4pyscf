@@ -1,4 +1,5 @@
 import unittest
+import cupy as cp
 import numpy as np
 import pyscf
 from pyscf import lib
@@ -19,6 +20,48 @@ def tearDownModule():
     del mol
 
 class KnowValues(unittest.TestCase):
+    def test_order3_potential(self):
+        mf = itrf.add_mm_charges(
+            rks.RKS(mol), [[1,2,-1], [3,4,5]], np.eye(3)*15,
+            [-5,5], [0.8,1.2], rcut_ewald=8, rcut_hcore=6)
+        mf.pop_method = 'lowdin'
+        mf.pre_orth_ao = None
+        mf.mm_mol.multipole_order = 3
+        dm = mf.get_init_guess()
+        hess = mf.mm_mol.get_ewald_pot(mol.atom_coords())
+        mm_potential = mf.get_mm_ewald_pot(mol, mf.mm_mol)
+        rng = np.random.default_rng(302)
+        direction = rng.normal(size=dm.shape)
+        direction = cp.asarray((direction + direction.T) / np.linalg.norm(direction))
+
+        def energy(dm, hess, mm_potential):
+            qm_potential = mf.get_qm_ewald_pot(mol, dm, hess)
+            return mf.energy_ewald(dm, mm_potential, qm_potential).item()
+
+        step = 1e-4
+        cases = [('dipole-quadrupole', (4,), False),
+                 ('monopole-octupole', (5,), False),
+                 ('MM-octupole', (), True),
+                 ('combined', (4, 5), True)]
+        for name, blocks, with_mm in cases:
+            isolated = [h if i in blocks else cp.zeros_like(h) for i, h in enumerate(hess)]
+            mm_isolated = [v if with_mm and i == 3 else cp.zeros_like(v)
+                           for i, v in enumerate(mm_potential)]
+            mf.mm_mol.energy_decomp = False
+            numerical = (energy(dm + step*direction, isolated, mm_isolated)
+                         - energy(dm - step*direction, isolated, mm_isolated))/(2*step)
+            for decomp in (False, True):
+                with self.subTest(term=name, energy_decomp=decomp):
+                    mf.mm_mol.energy_decomp = decomp
+                    potential = mf.get_qm_ewald_pot(mol, dm, isolated)
+                    if decomp:
+                        potential = [sum(parts) for parts in potential[-1]]
+                    if with_mm:
+                        potential[3] += mm_potential[3]
+                    vdiff = mf.get_vdiff(mol, potential)
+                    analytic = cp.einsum('ij,ji->', vdiff, direction).item()
+                    self.assertAlmostEqual(analytic, numerical, delta=1e-10)
+
     def test_finite_difference_gradient(self):
         mf = rks.RKS(mol, xc='PBE').density_fit(auxbasis='cc-pvdz-jkfit')
         mf.grids.atom_grid = (99, 974)
